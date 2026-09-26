@@ -26,12 +26,9 @@ dist/
 
 # Misc
 .DS_Store
-.env
-.env.local
 .env.development.local
 .env.test.local
 .env.production.local
-.env.development
 
 # Logs
 logs
@@ -70,7 +67,6 @@ output.txt
 *.launch
 .settings/
 *.sublime-workspace
-.vscode/
 
 # Lockfiles
 yarn.lock
@@ -105,8 +101,6 @@ reports/*
 !reports/.gitkeep
 
 .trae/
-.env.test
-.env
 # ---------------------------------------------------------------------------
 # AI assistant / coding-agent artifacts
 # Keep tool-specific config, history and caches out of the repo so the project
@@ -153,3 +147,7 @@ AGENTS.md
 .cody/
 # SpecStory
 .specstory/
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+config.bat
