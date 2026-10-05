@@ -1,4 +1,4 @@
-import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
+import { Inject, Injectable, Logger, NotImplementedException, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { PrismaService } from '../prisma/prisma.service';
@@ -6,8 +6,6 @@ import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { randomUUID } from 'crypto';
 import { StellarLedgerSource } from './stellar-ledger-source';
-
-import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { MetricsService } from '../observability/metrics/metrics.service';
 import {
@@ -170,8 +168,8 @@ export class LedgerReconciliationService {
     private readonly onchainAdapter: OnchainAdapter,
     private readonly configService: ConfigService,
     private readonly metricsService: MetricsService,
-    @Optional() private readonly auditService?: AuditService,
     private readonly ledgerSource: StellarLedgerSource,
+    @Optional() private readonly auditService?: AuditService,
   ) {}
 
   /**

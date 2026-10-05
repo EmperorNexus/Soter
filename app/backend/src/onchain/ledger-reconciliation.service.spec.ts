@@ -100,8 +100,8 @@ describe('LedgerReconciliationService', () => {
       adapterMock as unknown as OnchainAdapter,
       configMock as unknown as ConfigService,
       metricsMock as unknown as MetricsService,
-      auditMock as unknown as AuditService,
       ledgerSourceMock as unknown as StellarLedgerSource,
+      auditMock as unknown as AuditService,
     );
   });
 
