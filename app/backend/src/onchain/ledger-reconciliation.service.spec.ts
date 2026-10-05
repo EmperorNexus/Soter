@@ -8,6 +8,7 @@ import { AuditService } from '../audit/audit.service';
 import { MetricsService } from '../observability/metrics/metrics.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { OnchainAdapter } from './onchain.adapter';
+import { StellarLedgerSource } from './stellar-ledger-source';
 import {
   LEDGER_RECONCILIATION_AUDIT_ENTITY,
   LEDGER_RECONCILIATION_DISCREPANCY_METRIC,
@@ -52,6 +53,13 @@ describe('LedgerReconciliationService', () => {
     record: jest.fn(),
   };
 
+  const ledgerSourceMock = {
+    isEnabled: jest.fn(),
+    describeUnavailable: jest.fn(),
+    fetchLedgerEntries: jest.fn(),
+    sourceKind: 'soroban-rpc' as const,
+  };
+
   const onchainTotals = (
     campaignRef: string,
     tokenAddress: string,
@@ -70,6 +78,12 @@ describe('LedgerReconciliationService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
 
+    ledgerSourceMock.isEnabled.mockReturnValue(true);
+    ledgerSourceMock.describeUnavailable.mockReturnValue(
+      'no on-chain source configured',
+    );
+    ledgerSourceMock.fetchLedgerEntries.mockResolvedValue([]);
+
     prismaMock.balanceLedger.aggregate.mockResolvedValue({
       _sum: { amount: 0 },
     });
@@ -87,6 +101,7 @@ describe('LedgerReconciliationService', () => {
       configMock as unknown as ConfigService,
       metricsMock as unknown as MetricsService,
       auditMock as unknown as AuditService,
+      ledgerSourceMock as unknown as StellarLedgerSource,
     );
   });
 
