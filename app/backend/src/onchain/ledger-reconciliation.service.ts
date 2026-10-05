@@ -166,7 +166,7 @@ export class LedgerReconciliationService {
   constructor(
     private readonly prisma: PrismaService,
     @InjectQueue('onchain') private readonly onchainQueue: Queue,
-@Inject(ONCHAIN_ADAPTER_TOKEN)
+    @Inject(ONCHAIN_ADAPTER_TOKEN)
     private readonly onchainAdapter: OnchainAdapter,
     private readonly configService: ConfigService,
     private readonly metricsService: MetricsService,

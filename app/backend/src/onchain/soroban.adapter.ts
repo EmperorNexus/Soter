@@ -728,8 +728,12 @@ export class SorobanAdapter implements OnchainAdapter {
       totals: {
         campaignRef: params.campaignRef,
         tokenAddress: params.tokenAddress,
-        totalLocked: String(locked ?? '0'),
-        totalClaimed: String(claimed ?? '0'),
+        totalLocked: String(
+          (locked as string | number | bigint | null | undefined) ?? '0',
+        ),
+        totalClaimed: String(
+          (claimed as string | number | bigint | null | undefined) ?? '0',
+        ),
       },
       timestamp: new Date(),
     };

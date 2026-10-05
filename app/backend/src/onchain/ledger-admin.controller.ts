@@ -473,7 +473,7 @@ export class LedgerAdminController {
   @ApiForbiddenResponse({
     description: 'Access denied - admin role required.',
   })
-  async getLatestBalanceReconciliation() {
+  getLatestBalanceReconciliation() {
     const report =
       this.reconciliationService.getLastBalanceReconciliationReport();
     if (!report) {
