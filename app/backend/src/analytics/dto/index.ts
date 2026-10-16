@@ -142,3 +142,117 @@ export class MapDataQuery {
   @ApiPropertyOptional({ example: 'delivered' })
   status?: string;
 }
+
+export class AidPackageAggregatesDto {
+  @ApiProperty({ example: '5000000000' })
+  totalCommitted: string;
+
+  @ApiProperty({ example: '2000000000' })
+  totalClaimed: string;
+
+  @ApiProperty({ example: '500000000' })
+  totalExpiredCancelled: string;
+}
+
+export class TokenAggregatesDto {
+  @ApiProperty({
+    example: 'GATEMHCCkCY67ZUCKTROYN24ZYT5GK4EQZ5LKG3FZTSZ3NYNEJBBENSN',
+  })
+  tokenAddress: string;
+
+  @ApiProperty({ type: AidPackageAggregatesDto })
+  aggregates: AidPackageAggregatesDto;
+}
+
+export class ContractAggregatesDto {
+  @ApiProperty({ type: AidPackageAggregatesDto })
+  aggregates: AidPackageAggregatesDto;
+
+  @ApiProperty({ type: [TokenAggregatesDto], required: false })
+  tokenAggregates?: TokenAggregatesDto[];
+
+  @ApiProperty({ example: '2026-03-30T12:30:00.000Z' })
+  timestamp: string;
+}
+
+export class ContractAggregatesQuery {
+  @ApiPropertyOptional({
+    example: 'GATEMHCCkCY67ZUCKTROYN24ZYT5GK4EQZ5LKG3FZTSZ3NYNEJBBENSN',
+  })
+  token?: string;
+}
+
+export class VerificationThroughputQuery {
+  @ApiPropertyOptional({ example: '2026-01-01' })
+  from?: string;
+
+  @ApiPropertyOptional({ example: '2026-03-30' })
+  to?: string;
+
+  @ApiProperty({ example: 'hour', enum: ['hour', 'day'], default: 'hour' })
+  bucket: 'hour' | 'day' = 'hour';
+}
+
+export class VerificationThroughputBucket {
+  @ApiProperty({ example: '2026-03-30T10:00:00Z' })
+  bucketStart: string;
+
+  @ApiProperty({ example: 120 })
+  claimsProcessed: number;
+
+  @ApiProperty({ example: 100 })
+  passed: number;
+
+  @ApiProperty({ example: 15 })
+  review: number;
+
+  @ApiProperty({ example: 5 })
+  rejected: number;
+
+  @ApiProperty({ example: 4200, nullable: true })
+  avgTimeToDecisionMs: number | null;
+}
+
+export class VerificationThroughputDto {
+  @ApiProperty({ example: '2026-03-01T00:00:00Z' })
+  windowFrom: string;
+
+  @ApiProperty({ example: '2026-03-30T23:59:59Z' })
+  windowTo: string;
+
+  @ApiProperty({ example: 'hour' })
+  bucket: 'hour' | 'day';
+
+  @ApiProperty({ example: 2400 })
+  totalClaimsProcessed: number;
+
+  @ApiProperty({ example: 100.5 })
+  claimsPerHour: number;
+
+  @ApiProperty({ example: 2000 })
+  passed: number;
+
+  @ApiProperty({ example: 300 })
+  review: number;
+
+  @ApiProperty({ example: 100 })
+  rejected: number;
+
+  @ApiProperty({ example: 0.8333 })
+  passRate: number;
+
+  @ApiProperty({ example: 0.125 })
+  reviewRate: number;
+
+  @ApiProperty({ example: 0.0417 })
+  rejectRate: number;
+
+  @ApiProperty({ example: 4200, nullable: true })
+  avgTimeToDecisionMs: number | null;
+
+  @ApiProperty({ type: [VerificationThroughputBucket] })
+  buckets: VerificationThroughputBucket[];
+
+  @ApiProperty({ example: '2026-03-30T10:00:00Z' })
+  computedAt: string;
+}

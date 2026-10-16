@@ -1,49 +1,13 @@
-// import {        Controller, Get, Version        } from '@nestjs/common';
-// import { ApiOkResponse, ApiOperation, ApiTags } from '@nestjs/swagger';
-// import { API_VERSIONS } from '../common/constants/api-version.constants';
-// import { Public } from '../common/decorators/public.decorator';
-// import { AnalyticsService, MapDataPoint } from './analytics.service';
-
-// @ApiTags('Analytics')
-// @Controller('analytics')
-// export class AnalyticsController {
-//   constructor(private readonly analyticsService: AnalyticsService) {}
-
-//   @Public()
-//   @Get('map-data')
-//   @Version(API_VERSIONS.V1)
-//   @ApiOperation({
-//     summary: 'Get anonymized distribution data for the global dashboard map',
-//   })
-//   @ApiOkResponse({
-//     description: 'List of anonymized aid package distribution points.',
-//     schema: {
-//       example: [
-//         {
-//           id: 'pkg-001',
-//           lat: 6.5244,
-//           lng: 3.3792,
-//           amount: 250,
-//           token: 'USDC',
-//           status: 'delivered',
-//         },
-//       ],
-//     },
-//   })
-//   getMapData(): MapDataPoint[] {
-//     return this.analyticsService.getMapData();
-//   }
-// }
-
 /**
  * @file analytics.controller.ts
  *
- * Exposes the two analytics endpoints consumed by the global dashboard:
+ * Exposes the analytics endpoints consumed by the global dashboard:
  *
- *   GET /analytics/global-stats   — aggregated totals + breakdowns
- *   GET /analytics/map-data       — anonymised Leaflet map points
+ *   GET /analytics/global-stats            — aggregated totals + breakdowns
+ *   GET /analytics/map-data               — anonymised Leaflet map points
+ *   GET /analytics/verification-throughput — verification throughput aggregates
  *
- * Both endpoints are read-only and accept optional query parameters for
+ * All endpoints are read-only and accept optional query parameters for
  * filtering by region, token type, and timeframe.
  */
 
@@ -69,6 +33,10 @@ import {
   GeoJsonFeatureCollection,
   GlobalStatsQuery,
   MapDataQuery,
+  ContractAggregatesDto,
+  ContractAggregatesQuery,
+  VerificationThroughputDto,
+  VerificationThroughputQuery,
 } from './dto';
 
 @ApiTags('Analytics')
@@ -153,5 +121,59 @@ export class AnalyticsController {
     const query: MapDataQuery = { region, token, status };
     this.logger.log(`GET /analytics/map-anonymized ${JSON.stringify(query)}`);
     return this.analyticsService.getMapAnonymizedData(query);
+  }
+
+  @Public()
+  @Get('contract-aggregates')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Get contract aggregates',
+    description:
+      'Returns aggregated statistics from the onchain contract including total committed, claimed, and expired amounts.',
+  })
+  @ApiOkResponse({
+    description: 'Contract aggregates retrieved successfully.',
+    type: ContractAggregatesDto,
+  })
+  @ApiQuery({ name: 'token', required: false, type: String })
+  async getContractAggregates(
+    @Query('token') token?: string,
+  ): Promise<ContractAggregatesDto> {
+    const query: ContractAggregatesQuery = { token };
+    this.logger.log(
+      `GET /analytics/contract-aggregates ${JSON.stringify(query)}`,
+    );
+    return this.analyticsService.getContractAggregates(query);
+  }
+
+  @Public()
+  @Get('verification-throughput')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Get verification throughput aggregates',
+    description:
+      'Returns claims processed per hour, pass/review/reject distribution, and average time-to-decision over the requested time window.',
+  })
+  @ApiOkResponse({
+    description: 'Verification throughput aggregates retrieved successfully.',
+    type: VerificationThroughputDto,
+  })
+  @ApiQuery({ name: 'from', required: false, type: String })
+  @ApiQuery({ name: 'to', required: false, type: String })
+  @ApiQuery({
+    name: 'bucket',
+    required: false,
+    enum: ['hour', 'day'],
+  })
+  async getVerificationThroughput(
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+    @Query('bucket') bucket?: 'hour' | 'day',
+  ): Promise<VerificationThroughputDto> {
+    const query: VerificationThroughputQuery = { from, to, bucket };
+    this.logger.log(
+      `GET /analytics/verification-throughput ${JSON.stringify(query)}`,
+    );
+    return this.analyticsService.getVerificationThroughput(query);
   }
 }

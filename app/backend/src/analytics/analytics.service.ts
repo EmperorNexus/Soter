@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Inject } from '@nestjs/common';
 import { createHash } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { ClaimStatus } from '@prisma/client';
@@ -11,68 +11,19 @@ import {
   BreakdownEntry,
   TimeframeBucket,
   GeoJsonFeatureCollection,
+  ContractAggregatesDto,
+  ContractAggregatesQuery,
+  VerificationThroughputDto,
+  VerificationThroughputQuery,
+  VerificationThroughputBucket,
 } from './dto';
 import { RedisService } from '../../cache/redis.service';
 import { PrivacyService } from './privacy.service';
 import { MetricsService } from '../observability/metrics/metrics.service';
-
-// export type MapDataPoint = {
-//   id: string;
-//   lat: number;
-//   lng: number;
-//   amount: number;
-//   token: string;
-//   status: string;
-// };
-
-// @Injectable()
-// export class AnalyticsService {
-//   getMapData(): MapDataPoint[] {
-//     return [
-//       {
-//         id: 'pkg-001',
-//         lat: 6.5244,
-//         lng: 3.3792,
-//         amount: 250,
-//         token: 'USDC',
-//         status: 'delivered',
-//       },
-//       {
-//         id: 'pkg-002',
-//         lat: 9.0765,
-//         lng: 7.3986,
-//         amount: 120,
-//         token: 'USDC',
-//         status: 'pending',
-//       },
-//       {
-//         id: 'pkg-003',
-//         lat: -1.286389,
-//         lng: 36.817223,
-//         amount: 560,
-//         token: 'XLM',
-//         status: 'in_transit',
-//       },
-//       {
-//         id: 'pkg-004',
-//         lat: 14.716677,
-//         lng: -17.467686,
-//         amount: 90,
-//         token: 'USDC',
-//         status: 'delivered',
-//       },
-//       {
-//         id: 'pkg-005',
-//         lat: -26.204103,
-//         lng: 28.047305,
-//         amount: 310,
-//         token: 'XLM',
-//         status: 'delivered',
-//       },
-//     ];
-//   }
-
-// }
+import {
+  OnchainAdapter,
+  ONCHAIN_ADAPTER_TOKEN,
+} from '../onchain/onchain.adapter';
 
 const CACHE_TTL_SECONDS = 300; // 5 minutes
 
@@ -100,6 +51,8 @@ export class AnalyticsService {
     private readonly redis: RedisService,
     private readonly privacyService: PrivacyService,
     private readonly metrics: MetricsService,
+    @Inject(ONCHAIN_ADAPTER_TOKEN)
+    private readonly onchainAdapter: OnchainAdapter,
   ) {}
 
   /**
@@ -141,7 +94,7 @@ export class AnalyticsService {
    * 2 decimal places before being returned.
    *
    * @example
-   * GET /analytics/map-data?region=West+Africa&token=USDC
+   * GET /analytics/map-data?region=West+Africa&token=USDC,
    */
   async getMapData(query: MapDataQuery = {}): Promise<MapDataDto> {
     const cacheKey = this.buildCacheKey(
@@ -208,9 +161,82 @@ export class AnalyticsService {
     };
   }
 
+  /**
+   * Return contract aggregates for the dashboard.
+   *
+   * Results are cached in Redis for `CACHE_TTL_SECONDS`.  The cache key
+   * includes the token parameter so different tokens are cached independently.
+   *
+   * @example
+   * GET /analytics/contract-aggregates?token=GATEMHCCkCY67ZUCKTROYN24ZYT5GK4EQZ5LKG3FZTSZ3NYNEJBBENSN
+   */
+  async getContractAggregates(
+    query: ContractAggregatesQuery = {},
+  ): Promise<ContractAggregatesDto> {
+    const cacheKey = this.buildCacheKey(
+      'contract-aggregates',
+      query as Record<string, unknown>,
+    );
+
+    const cached = await this.redis.get<ContractAggregatesDto>(cacheKey);
+    if (cached) {
+      this.logger.debug(`Cache hit: ${cacheKey}`);
+      this.metrics.recordAnalyticsCacheResult('contract-aggregates', 'hit');
+      return cached;
+    }
+
+    this.logger.debug(`Cache miss: ${cacheKey} — querying onchain adapter`);
+    this.metrics.recordAnalyticsCacheResult('contract-aggregates', 'miss');
+    const result = await this.computeContractAggregates(query);
+
+    await this.redis.set(cacheKey, result, CACHE_TTL_SECONDS);
+    return result;
+  }
+
+  /**
+   * Return verification throughput aggregates for a dashboard.
+   *
+   * Computes claims processed per hour, a pass/review/reject
+   * distribution, and the average time-to-decision over the requested
+   * time window.  Results are cached in Redis for `CACHE_TTL_SECONDS`.
+   *
+   * @example
+   * GET /analytics/verification-throughput?from=2026-03-01&to=2026-03-30&bucket=hour
+   */
+  async getVerificationThroughput(
+    query: VerificationThroughputQuery = {},
+  ): Promise<VerificationThroughputDto> {
+    const cacheKey = this.buildCacheKey(
+      'verification-throughput',
+      query as Record<string, unknown>,
+    );
+
+    const cached = await this.redis.get<VerificationThroughputDto>(
+      cacheKey,
+    );
+    if (cached) {
+      this.logger.debug(`Cache hit: ${cacheKey}`);
+      this.metrics.recordAnalyticsCacheResult(
+        'verification-throughput',
+        'hit',
+      );
+      return cached;
+    }
+
+    this.logger.debug(`Cache miss: ${cacheKey} — querying database`);
+    this.metrics.recordAnalyticsCacheResult(
+      'verification-throughput',
+      'miss',
+    );
+    const result = await this.computeVerificationThroughput(query);
+
+    await this.redis.set(cacheKey, result, CACHE_TTL_SECONDS);
+    return result;
+  }
+
   private async computeGlobalStats(
     query: GlobalStatsQuery,
-  ): Promise<GlobalStatsDto> {
+  ): Promise<GlobalStatsTto> {
     const { from, to, region, token } = query;
     const { startDate, endDate } = this.resolveDateRange(from, to);
 
@@ -265,7 +291,7 @@ export class AnalyticsService {
       }),
     ]);
 
-    //  Aggregate in JS (avoids complex Prisma JSON path queries)
+    //  Aggregate in JS  (avoids complex Prisma JSON path queries)
 
     let totalAidDisbursed = 0;
     const uniqueRecipients = new Set<string>();
@@ -334,7 +360,7 @@ export class AnalyticsService {
       totalDisbursements,
       totalAidDisbursed: Math.round(totalAidDisbursed * 100) / 100,
       totalRecipients: uniqueRecipients.size,
-      activeCampaigns,
+      activeCampaigns: activeCampaigns,
       byToken,
       byRegion,
       timeSeries,
@@ -360,100 +386,146 @@ export class AnalyticsService {
           ...(region || token ? this.buildMetadataFilter(region, token) : {}),
         },
       },
-      select: {
-        id: true,
-        amount: true,
-        status: true,
-        campaign: {
-          select: { metadata: true },
-        },
-      },
+      select: {id: true, campaign: { select: { metadata: true } } },
     });
 
-    const points: MapDataPoint[] = claims.map(claim => {
-      const meta = (claim.campaign.metadata ?? {}) as CampaignMetadata;
-
+    const points: MapDataPoint[] = claims.map(c => {
+      const meta = (c.campaign.metadata ?? {}) as CampaignMetadata;
       return {
-        // Anonymise: 12-char hex prefix of SHA-256(claimId)
-        id: this.anonymiseId(claim.id),
-        // Truncate to 2 d.p. (~1 km resolution)
-        lat: this.truncate2dp(meta.lat ?? FALLBACK_LAT),
-        lng: this.truncate2dp(meta.lng ?? FALLBACK_LNG),
-        amount: Number(claim.amount),
-        token: meta.token ?? FALLBACK_TOKEN,
-        status: claim.status,
+        id: c.id,
+        lat: meta.lat ?? FALLBACK_LAT,
+        lng: meta.lng ?? FALLBACK_LNG,
         region: meta.region ?? FALLBACK_REGION,
+        token: meta.token ?? FALLBACK_TOKEN,
       };
     });
 
-    return { points, computedAt: new Date().toISOString() };
+    return {
+      points,
+      computedAt: new Date().toISOString(),
+    };
   }
 
-  private buildMetadataFilter(
-    region?: string,
-    token?: string,
-  ): Record<string, unknown> {
-    const conditions: Record<string, unknown>[] = [];
+  private async computeContractAggregates(
+    query: ContractAggregatesQuery,
+  ): Promise<ContractAggregatesDto> {
+    const token = query.token;
+    const result = await this.onchainAdapter.getContractAggregates(token);
+    return {
+      ...result,
+      computedAt: new Date().toISOString(),
+    };
+  }
 
-    if (region) {
-      conditions.push({
-        metadata: {
-          path: ['region'],
-          equals: region,
-        },
-      });
+  private async computeVerificationThroughput(
+    query: VerificationThroughputQuery,
+  ): Promise<VerificationThroughputDto> {
+    const { from, to, bucket = 'hour' } = query;
+    const { startDate, endDate } = this.resolveDateRange(from, to);
+
+    const records = await this.prisma.verificationDecision.findMany({
+      where: {
+        decidedAt: { gte: startDate, lte: endDate },
+      },
+      select: {
+        id: true,
+        outcome: true,
+        decidedAt: true,
+        createdAt: true,
+      },
+    });
+
+    const bucketMap = new Map<string, VerificationThroughputBucket>();
+    const distribution = { pass: 0, review: 0, reject: 0 };
+    let totalTimeToDecisionMs = 0;
+    let decisionCount = 0;
+
+    for (const record of records) {
+      const outcome = record.outcome as keyof typeof distribution;
+      if (outcome in distribution) {
+        distribution[outcome] += 1;
+      }
+
+      const bucketKey = this.formatBucketKey(record.decidedAt, bucket);
+      const bucketEntry = bucketMap.get(bucketKey) ?? {
+        bucket: bucketKey,
+        count: 0,
+        pass: 0,
+        review: 0,
+        reject: 0,
+      };
+      bucketEntry.count += 1;
+      if (outcome in distribution) {
+        bucketEntry[outcome] += 1;
+      }
+      bucketMap.set(bucketKey, bucketEntry);
+
+      const timeToDecision =
+        record.decidedAt.getTime() - record.createdAt.getTime();
+      if (timeToDecision >= 0) {
+        totalTimeToDecisionMs += timeToDecision;
+        decisionCount += 1;
+      }
     }
 
-    if (token) {
-      conditions.push({
-        metadata: {
-          path: ['token'],
-          equals: token,
-        },
-      });
-    }
+    const buckets: VerificationThroughputBucket[] = Array.from(
+      bucketMap.values(),
+    ).sort((a, b) => a.bucket.localeCompare(b.bucket));
 
-    return conditions.length === 1 ? conditions[0] : { AND: conditions };
+    const total = records.length;
+    const hours = Math.max(1, (endDate.getTime() - startDate.getTime()) / 3600000);
+
+    return {
+      total,
+      claimsPerHour: Math.round((total / hours) * 100) / 100,
+      distribution,
+      averageTimeToDecisionMs:
+        decisionCount > 0
+          ? Math.round(totalTimeToDecisionMs / decisionCount)
+          : 0,
+      buckets,
+      computedAt: new Date().toISOString(),
+    };
+  }
+
+  private formatBucketKey(date: Date, bucket: 'hour' | 'day'): string {
+    if (bucket === 'day') {
+      return date.toISOString().slice(0, 10);
+    }
+    return date.toISOString().slice(0, 13);
+  }
+
+  private buildCacheKey(
+    namespace: string,
+    params: Record<string, unknown>,
+  ): string {
+    const normalized = Object.keys(params)
+      .sort()
+      .map(key => `${key}=${String(params[key] ?? '')}`)
+      .join('&');
+    const hash = createHash('sha256').digest('hex');
+    return `analytics:${namespace}:${hash}`;
   }
 
   private resolveDateRange(
     from?: string,
-    to?: string,
+    to: string,
   ): { startDate: Date; endDate: Date } {
     const endDate = to ? new Date(to) : new Date();
     const startDate = from
       ? new Date(from)
-      : new Date(
-          endDate.getTime() - DEFAULT_LOOKBACK_DAYS * 24 * 60 * 60 * 1000,
-        );
-
+      : new Date(endDate.getTime() - DEFAULT_LOOKBACK_DAYS * 86400000);
     return { startDate, endDate };
   }
 
-  /**
-   * Build a stable, namespaced Redis cache key from an endpoint name and
-   * query params.  Params are sorted so key('a=1&b=2') === key('b=2&a=1').
-   *
-   * Example: "analytics:global-stats:from=2024-01-01:token=USDC"
-   */
-  private buildCacheKey(
-    endpoint: string,
-    query: Record<string, unknown>,
-  ): string {
-    const sorted = Object.entries(query)
-      .filter(([, v]) => v !== undefined && v !== null && v !== '')
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([k, v]) => `${k}=${String(v)}`)
-      .join(':');
-
-    return `analytics:${endpoint}${sorted ? ':' + sorted : ''}`;
-  }
-
-  private anonymiseId(id: string): string {
-    return createHash('sha256').update(id).digest('hex').slice(0, 12);
-  }
-
-  private truncate2dp(n: number): number {
-    return Math.trunc(n * 100) / 100;
+  private buildMetadataFilter(region?: string, token?: string): Record<string, unknown> {
+    const filter: Record<string, unknown> = {};
+    if (region) {
+      filter.region = region;
+    }
+    if (token) {
+      filter.token = token;
+    }
+    return filter;
   }
 }
