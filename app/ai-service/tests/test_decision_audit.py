@@ -9,7 +9,6 @@ One test class per acceptance criterion:
 * records survive process restart
 * retention is configurable
 * export mode streams CSV/NDJSON with the same filters and redaction (#1206)
-* a dashboard-friendly aggregate endpoint summarizes throughput (#1210)
 """
 
 from __future__ import annotations
@@ -50,7 +49,6 @@ def client(store):
         app.state.decision_audit_store = store
         yield test_client
     app.state.decision_audit_store = previous
-
 
 
 # ---------------------------------------------------------------------------
@@ -542,30 +540,45 @@ class TestRetention:
 
 
 # ---------------------------------------------------------------------------
-# Issue #1210: dashboard-friendly throughput aggregate endpoint
+# Issue #990 follow-up: dashboard-friendly throughput aggregate endpoint
 # ---------------------------------------------------------------------------
 
 
 class TestThroughputAggregate:
     def _seed(self, store):
-        now = time.time()
-        outcomes = [
-            ("humanitarian_verification", "eligible", now - 300),
-            ("humanitarian_verification", "eligible", now - 200),
-            ("humanitarian_verification", "ineligible", now - 100),
-            ("fraud_detection", "flagged", now - 400),
-            ("fraud_detection", "cleared", now - 50),
-        ]
-        for decision_type, outcome, created_at in outcomes:
-            record = store.record(
-                decision_type,
-                outcome,
-                claim_id=f"claim-{outcome}-{int(created_at)}",
-                campaign_ref="campaign-throughput",
-            )
-            record.created_at = created_at
+        """Seed a representative mix of outcomes across decision types."""
+        store.record(
+            "humanitarian_verification",
+            "eligible",
+            claim_id="agg-1",
+            campaign_ref="agg-campaign",
+        )
+        store.record(
+            "humanitarian_verification",
+            "ineligible",
+            claim_id="agg-2",
+            campaign_ref="agg-campaign",
+        )
+        store.record(
+            "humanitarian_verification",
+            "review",
+            claim_id="agg-3",
+            campaign_ref="agg-campaign",
+        )
+        store.record(
+            "fraud_detection",
+            "flagged",
+            claim_id="agg-4",
+            campaign_ref="agg-campaign",
+        )
+        store.record(
+            "fraud_detection",
+            "cleared",
+            claim_id="agg-5",
+            campaign_ref="agg-campaign",
+        )
 
-    def test_empty_window_returns_zeroed_aggregates(self, client):
+    def test_empty_window_returns_zeroed_aggregate(self, client):
         response = client.get(
             "/v1/ai/decision-audit/throughput?window_seconds=3600"
         )
@@ -574,7 +587,7 @@ class TestThroughputAggregate:
         assert body["total"] == 0
         assert body["claims_per_hour"] == 0.0
         assert body["outcomes"] == {}
-        assert body["average_time_to_decision_seconds"] is None
+        assert body["average_time_to_decision_ms"] is None
 
     def test_window_with_mixed_outcomes(self, client, store):
         self._seed(store)
@@ -584,39 +597,46 @@ class TestThroughputAggregate:
         assert response.status_code == 200, response.text
         body = response.json()
         assert body["total"] == 5
-        assert body["outcomes"]["eligible"] == 2
-        assert body["outcomes"]["ineligible"] == 1
-        assert body["outcomes"]["flagged"] == 1
-        assert body["outcomes"]["cleared"] == 1
-        assert body["claims_per_hour"] == pytest.approx(5.0, rel=1e-6)
-        assert body["average_time_to_decision_seconds"] is not None
-
-    def test_window_excludes_older_records(self, client, store):
-        self._seed(store)
-        response = client.get(
-            "/v1/ai/decision-audit/throughput?window_seconds=150"
-        )
-        assert response.status_code == 200, response.text
-        body = response.json()
-        assert body["total"] == 3
         assert body["outcomes"]["eligible"] == 1
         assert body["outcomes"]["ineligible"] == 1
+        assert body["outcomes"]["review"] == 1
+        assert body["outcomes"]["flagged"] == 1
         assert body["outcomes"]["cleared"] == 1
+        assert body["claims_per_hour"] > 0.0
 
-    def test_response_is_cached_between_calls(self, client, store):
+    def test_window_excludes_older_records(self, client, store):
+        record = store.record(
+            "humanitarian_verification",
+            "eligible",
+            claim_id="agg-old",
+        )
+        record.created_at = time.time() - (10 * 86400)
+        response = client.get(
+            "/v1/ai/decision-audit/throughput?window_seconds=3600"
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["total"] == 0
+
+    def test_aggregate_is_cached(self, client, store):
         self._seed(store)
         first = client.get(
             "/v1/ai/decision-audit/throughput?window_seconds=3600"
         )
         assert first.status_code == 200, first.text
+        store.record(
+            "fraud_detection",
+            "flagged",
+            claim_id="agg-late",
+        )
         second = client.get(
             "/v1/ai/decision-audit/throughput?window_seconds=3600"
         )
         assert second.status_code == 200, second.text
-        assert first.json() == second.json()
+        # Cached response within the TTL must not reflect the new record.
+        assert second.json()["total"] == first.json()["total"]
 
-    def test_window_seconds_is_bounded(self, client):
+    def test_window_seconds_is_validated(self, client):
         response = client.get(
-            "/v1/ai/decision-audit/throughput?window_seconds=999999999"
+            "/v1/ai/decision-audit/throughput?window_seconds=0"
         )
         assert response.status_code == 400

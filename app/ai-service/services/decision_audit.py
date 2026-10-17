@@ -44,6 +44,7 @@ import os
 import tempfile
 import time
 import uuid
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from threading import Lock
 from typing import Any, Dict, Iterable, List, Optional, Set
@@ -56,8 +57,8 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "AUDIT_RECORD_SCHEMA_VERSION",
     "DecisionAuditRecord",
-    "DecisionAuditThroughput",
     "DecisionAuditStore",
+    "ThroughputSummary",
     "build_store_from_settings",
     "get_store",
     "set_store",
@@ -71,12 +72,13 @@ AUDIT_RECORD_SCHEMA_VERSION = "1"
 #: the whole log, so it must not run on every single write.
 _PRUNE_EVERY_N_WRITES = 100
 
-#: Default window (seconds) for throughput aggregates when the caller does not
-#: specify one. One hour matches the "claims processed per hour" dashboard
-#: cadence and keeps the scan bounded.
-_DEFAULT_THROUGHPUT_WINDOW_SECONDS = 3600.0
-
 _SECONDS_PER_DAY = 86400.0
+
+#: Default window (in seconds) used by :meth:`DecisionAuditStore.throughput`
+#: when the caller does not supply one. One hour matches the "claims processed
+#: per hour" framing of the dashboard endpoint.
+DEFAULT_THROUGHPUT_WINDOW_SECONDS = 3600.0
+
 
 
 def _redact_value(value: Any) -> Any:
@@ -94,6 +96,31 @@ def _redact_value(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_redact_value(v) for v in value]
     return value
+
+
+@dataclass
+class ThroughputSummary:
+    """Aggregate verification throughput over a bounded time window.
+
+    Shaped for direct dashboard consumption: no raw audit records are
+    returned, only counts and averages. See
+    :meth:`DecisionAuditStore.throughput`.
+    """
+
+    window_start: float
+    window_end: float
+    window_seconds: float
+    total: int
+    per_hour: float
+    outcomes: Dict[str, int]
+    average_time_to_decision_seconds: Optional[float]
+    decision_type: Optional[str] = None
+    #: True when the window was clamped to the store's retention horizon so
+    #: the caller knows the aggregate is bounded rather than exhaustive.
+    bounded: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass
@@ -163,51 +190,6 @@ class DecisionAuditRecord:
         return cls(**{k: v for k, v in data.items() if k in known})
 
 
-@dataclass
-class DecisionAuditThroughput:
-    """Aggregate throughput/outcome summary over a bounded time window.
-
-    Shaped for direct dashboard consumption: counts, a per-hour rate, the
-    pass/review/reject distribution, and the average time-to-decision. Built
-    from the in-memory index rather than re-scanning the durable log on every
-    call, so repeated dashboard polls stay cheap.
-    """
-
-    window_start: float
-    window_end: float
-    window_seconds: float
-    total: int
-    per_hour: float
-    outcomes: Dict[str, int]
-    outcome_distribution: Dict[str, float]
-    average_time_to_decision_seconds: Optional[float]
-    decision_types: Dict[str, int]
-    generated_at: float = field(default_factory=time.time)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-
-#: Outcomes that count as a "pass" for the distribution summary.
-_PASS_OUTCOMES = frozenset({"pass", "passed", "approve", "approved", "accept"})
-#: Outcomes that count as a "review" (needs human follow-up).
-_REVIEW_OUTCOMES = frozenset({"review", "needs_review", "escalate", "escalated"})
-#: Outcomes that count as a "reject".
-_REJECT_OUTCOMES = frozenset({"reject", "rejected", "deny", "denied", "fail", "failed"})
-
-
-def _outcome_bucket(outcome: str) -> str:
-    """Map a free-form outcome string onto pass/review/reject/other."""
-    normalised = (outcome or "").strip().lower()
-    if normalised in _PASS_OUTCOMES:
-        return "pass"
-    if normalised in _REVIEW_OUTCOMES:
-        return "review"
-    if normalised in _REJECT_OUTCOMES:
-        return "reject"
-    return "other"
-
-
 class DecisionAuditStore:
     """Append-only, restart-durable store of :class:`DecisionAuditRecord`.
 
@@ -236,6 +218,10 @@ class DecisionAuditStore:
         self._by_campaign: Dict[str, List[str]] = {}
         self._by_id: Dict[str, DecisionAuditRecord] = {}
         self._writes_since_prune = 0
+        #: Monotonic counter bumped on every mutation, so callers can cheaply
+        #: invalidate a cached throughput summary without rescanning records.
+        self._version = 0
+        self._throughput_cache: Dict[Any, tuple] = {}
 
         if self.enabled:
             self._load()
@@ -340,6 +326,7 @@ class DecisionAuditStore:
             return False
         self._records = keep
         self._reindex_locked()
+        self._version += 1
         return True
 
     def prune(self) -> int:
@@ -409,6 +396,7 @@ class DecisionAuditStore:
             with self._lock:
                 self._append_to_disk(record)
                 self._index(record)
+                self._version += 1
                 self._writes_since_prune += 1
                 if self._writes_since_prune >= _PRUNE_EVERY_N_WRITES:
                     self._writes_since_prune = 0
@@ -489,67 +477,75 @@ class DecisionAuditStore:
     def throughput(
         self,
         *,
-        window_seconds: float = _DEFAULT_THROUGHPUT_WINDOW_SECONDS,
+        window_seconds: float = DEFAULT_THROUGHPUT_WINDOW_SECONDS,
         decision_type: Optional[str] = None,
         now: Optional[float] = None,
-    ) -> DecisionAuditThroughput:
+    ) -> ThroughputSummary:
         """Aggregate throughput and outcome distribution over a time window.
 
-        Scans only the in-memory index (bounded by the retention policy, not
-        the full on-disk history) so a dashboard can poll this cheaply. The
-        window is ``[now - window_seconds, now]``; ``decision_type`` narrows
-        the aggregate to one class of decision when supplied.
+        Returns claims processed per hour, the pass/review/reject (and any
+        other) outcome counts, and the average time-to-decision, computed
+        from the in-memory index rather than by rescanning the durable log.
+
+        The window is clamped to the retention horizon so a caller asking for
+        "all time" cannot force a scan of pruned history; ``bounded`` in the
+        result signals when that clamp applied. Results are memoised per
+        (window, decision_type, version) so repeated dashboard polls do not
+        re-aggregate unchanged data.
         """
         end = time.time() if now is None else now
-        span = max(float(window_seconds), 0.0)
-        start = end - span
+        requested = max(float(window_seconds), 0.0)
+        start = end - requested
+        bounded = False
+        if self.retention_days is not None and self.retention_days > 0:
+            horizon = end - (self.retention_days * _SECONDS_PER_DAY)
+            if start < horizon:
+                start = horizon
+                bounded = True
+        effective_seconds = max(end - start, 0.0)
 
         with self._lock:
-            matches = [
-                r
-                for r in self._records
-                if start <= r.created_at <= end
-                and (decision_type is None or r.decision_type == decision_type)
-            ]
+            cache_key = (round(start, 3), round(end, 3), decision_type, self._version)
+            cached = self._throughput_cache.get(cache_key)
+            if cached is not None:
+                return cached
 
-        total = len(matches)
-        outcomes: Dict[str, int] = {}
-        decision_types: Dict[str, int] = {}
-        buckets = {"pass": 0, "review": 0, "reject": 0, "other": 0}
-        durations: List[float] = []
+            outcomes: Counter = Counter()
+            total = 0
+            latency_total = 0.0
+            latency_count = 0
+            for record in self._records:
+                if record.created_at < start or record.created_at > end:
+                    continue
+                if decision_type and record.decision_type != decision_type:
+                    continue
+                total += 1
+                outcomes[record.outcome] += 1
+                latency = record.metadata.get("time_to_decision_seconds")
+                if isinstance(latency, (int, float)):
+                    latency_total += float(latency)
+                    latency_count += 1
 
-        for record in matches:
-            outcomes[record.outcome] = outcomes.get(record.outcome, 0) + 1
-            decision_types[record.decision_type] = (
-                decision_types.get(record.decision_type, 0) + 1
+            per_hour = (
+                (total / effective_seconds) * 3600.0 if effective_seconds > 0 else 0.0
             )
-            buckets[_outcome_bucket(record.outcome)] += 1
-            decided_at = record.metadata.get("decided_at")
-            if isinstance(decided_at, (int, float)):
-                delta = record.created_at - float(decided_at)
-                if delta >= 0:
-                    durations.append(delta)
-
-        distribution: Dict[str, float] = {}
-        if total:
-            for bucket, count in buckets.items():
-                distribution[bucket] = count / total
-
-        hours = span / 3600.0 if span > 0 else 0.0
-        per_hour = (total / hours) if hours > 0 else 0.0
-        average_ttd = (sum(durations) / len(durations)) if durations else None
-
-        return DecisionAuditThroughput(
-            window_start=start,
-            window_end=end,
-            window_seconds=span,
-            total=total,
-            per_hour=per_hour,
-            outcomes=outcomes,
-            outcome_distribution=distribution,
-            average_time_to_decision_seconds=average_ttd,
-            decision_types=decision_types,
-        )
+            summary = ThroughputSummary(
+                window_start=start,
+                window_end=end,
+                window_seconds=effective_seconds,
+                total=total,
+                per_hour=per_hour,
+                outcomes=dict(outcomes),
+                average_time_to_decision_seconds=(
+                    latency_total / latency_count if latency_count else None
+                ),
+                decision_type=decision_type,
+                bounded=bounded,
+            )
+            # Keep the cache small: only the most recent window matters for a
+            # dashboard, and stale versions are dropped as the version bumps.
+            self._throughput_cache = {cache_key: summary}
+            return summary
 
     def __len__(self) -> int:
         with self._lock:

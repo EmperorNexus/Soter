@@ -2,24 +2,29 @@
 
 Satisfies the "records are queryable by trace id, claim id, and campaign
 reference" acceptance criterion: an operator reconstructing why a claim was
-rejected weeks later hits ``GET /v1/ai/decision-audit?claim_id=...`` (or by
-``trace_id`` / ``campaign_ref``) and gets the inputs, provider, model, prompt
+rejected weeks later hits `GET /v1/ai/decision-audit?claim_id=...` (or by
+`trace_id` / `campaign_ref`) and gets the inputs, provider, model, prompt
 version, outcome, and reasons behind every decision made for that claim.
 
-Issue #1206 adds an export mode (``format=csv`` or ``format=ndjson``) that
+Issue #1206 adds an export mode (`format=csv` or `format=ndjson`) that
 streams a downloadable filtered set for compliance review without paging
 individual record lookups. Records are already redacted at write time (see
-``services/decision_audit.py``), so these endpoints expose no raw PII.
+`services/decision_audit.py`), so these endpoints expose no raw PII.
+
+Issue #1302 adds a dashboard-friendly throughput aggregate endpoint that
+summarises claims processed per hour, the pass/review/reject distribution,
+and the average time-to-decision over a requested time window. Results are
+cached per window so dashboards do not rescan the full audit history on
+every call.
 """
 
 from __future__ import annotations
 
-import csv
-import io
+import csv import io
 import json
 import logging
 import time
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -29,32 +34,21 @@ from services.decision_audit import DecisionAuditRecord, get_store
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(tags=["decision-audit"])
+router = APERouter(tags=["decision-audit"])
 
 #: Upper bound on how many records one JSON query can return, so a broad query
 #: cannot serialise an entire retention window into a single response.
-_MAX_LIMIT = 500
+MAX_LIMIT = 500
 
 #: Page size cap for export mode. Exports stream, so larger pages are safe; the
-#: client still paginates with ``offset`` / ``limit`` when the full set is huge.
-_MAX_EXPORT_LIMIT = 5000
+#: client still paginates with `offset` / `limit` when the full set is huge.
+MAX_EXPORT_LIMIT = 5000
 
-_EXPORT_FORMATS = frozenset({"csv", "ndjson"})
+EXPORT_FORMATS = frozenset({"csv", "ndjson"})
 
-#: Default and maximum lookback windows (seconds) for the throughput
-#: aggregate endpoint. Bounding the window keeps the scan from touching the
-#: full retention history on every dashboard refresh.
-_DEFAULT_THROUGHPUT_WINDOW = 3600.0
-_MAX_THROUGHPUT_WINDOW = 7 * 24 * 3600.0
-
-#: How long a computed throughput aggregate stays cached, keyed by the
-#: resolved (start, end) window. Dashboards poll frequently; this avoids
-#: re-scanning the audit store on every call.
-_THROUGHPUT_CACHE_TTL = 30.0
-
-#: Flat CSV columns. Nested ``inputs`` / ``reasons`` / ``metadata`` are
+#: Flat CSV columns. Nested `inputs` / `reasons` / `metadata` are
 #: serialised as JSON strings so the download stays one row per record.
-_CSV_COLUMNS = (
+CSV_COLUMNS = (
     "record_id",
     "created_at",
     "decision_type",
@@ -74,6 +68,18 @@ _CSV_COLUMNS = (
     "metadata",
     "schema_version",
 )
+
+#: How long a throughput aggregate is reused before being recomputed.
+#: Dashboards poll frequently; a short TTL bounds audit-store scan cost while
+#: keeping the view near-real-time.
+THROUGHPUT_CACHE_TTL_SECONDS = 30.0
+
+#: Maximum number of cache entries retained. Keyed by the requested window.
+THROUGHPUT CACHE_MAX_ENTRIES
+ = 256
+
+#: Outcomes that count as a completed decision for time-to-decision.
+DECISION_OUTCOMES = frozenset({"pass", "approve", "review", "reject"})
 
 
 def _resolve_store(http_request: Request):
@@ -100,57 +106,10 @@ def _require_query_identifier(
         )
 
 
-def _throughput_cache(http_request: Request) -> Dict[Tuple[float, float], Tuple[float, Dict[str, Any]]]:
-    """Return the per-app throughput cache, creating it on first use."""
-    cache = getattr(http_request.app.state, "decision_audit_throughput_cache", None)
-    if cache is None:
-        cache = {}
-        http_request.app.state.decision_audit_throughput_cache = cache
-    return cache
-
-
-def _compute_throughput(
-    records: List[DecisionAuditRecord],
-    window_start: float,
-    window_end: float,
-) -> Dict[str, Any]:
-    """Aggregate a bounded set of records into dashboard-friendly metrics."""
-    total = len(records)
-    outcomes: Dict[str, int] = {}
-    decision_times: List[float] = []
-    for record in records:
-        outcome = (record.outcome or "unknown").strip().lower() or "unknown"
-        outcomes[outcome] = outcomes.get(outcome, 0) + 1
-        decision_times.append(record.created_at)
-
-    window_seconds = max(window_end - window_start, 0.0)
-    hours = window_seconds / 3600.0
-    claims_per_hour = (total / hours) if hours > 0 else 0.0
-
-    # Time-to-decision is approximated from the audit record timestamps: the
-    # span between the oldest and newest decision in the window, averaged per
-    # record. This stays bounded and needs no extra store lookups.
-    if total > 1:
-        span = max(decision_times) - min(decision_times)
-        avg_time_to_decision = span / (total - 1)
-    else:
-        avg_time_to_decision = 0.0
-
-    return {
-        "window_start": window_start,
-        "window_end": window_end,
-        "window_seconds": window_seconds,
-        "total_decisions": total,
-        "claims_per_hour": round(claims_per_hour, 4),
-        "outcome_distribution": dict(sorted(outcomes.items())),
-        "average_time_to_decision_seconds": round(avg_time_to_decision, 4),
-    }
-
-
 def _record_to_csv_row(record: DecisionAuditRecord) -> Dict[str, Any]:
     data = record.to_dict()
     row: Dict[str, Any] = {}
-    for col in _CSV_COLUMNS:
+    for col in CSV_COLUMNS:
         value = data.get(col)
         if col in ("reasons", "inputs", "metadata"):
             row[col] = json.dumps(value, sort_keys=True, default=str)
@@ -170,7 +129,7 @@ def _stream_csv(records: Iterator[DecisionAuditRecord]) -> Iterator[str]:
     """Yield CSV header then one row per record without loading the full file."""
     buffer = io.StringIO()
     writer = csv.DictWriter(
-        buffer, fieldnames=list(_CSV_COLUMNS), extrasaction="ignore"
+        buffer, fieldnames=list(CSV_COLUMNS), extrasaction="ignore"
     )
     writer.writeheader()
     yield buffer.getvalue()
@@ -183,7 +142,167 @@ def _stream_csv(records: Iterator[DecisionAuditRecord]) -> Iterator[str]:
         buffer.truncate(0)
 
 
-@router.get(
+class _ThroughputCache:
+    """Bounded, TTL-backed cache for throughput aggregates."""
+
+    def __init__(self, ttl_seconds: float, max_entries: int) -> None:
+        self._ttl = ttl_seconds
+        self._max_entries = max_entries
+        self._entries: Dict[tuple, tuple] = {}
+
+    def get(self, key: tuple) -> Optional[Dict[str, Any]]:
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        expires_at, value = entry
+        if expires_at <= time.monotonic():
+            self._entries.pop(key, None)
+            return None
+        return value
+
+    def set(self, key: tuple, value: Dict[str, Any]) -> None:
+        if len(self._entries) >= self._max_entries:
+            # Evict the oldest expiring entry first so the cache stays bounded.
+            oldest = min(self._entries.items(), key=lambda item: item[1][0])
+            self._entries.pop(oldest[0], None)
+        self._entries[key] = (time.monotonic() + self._ttl, value)
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+
+_THROUGHPUT_CACHE = _ThroughputCache(
+    ttl_seconds=THROUGHPUT_CACHE_TTL_SECONDS,
+    max_entries=THROUGHPUT_CACHE_MAX_ENTRIES,
+)
+
+
+def _compute_throughput(
+    records: List[Dictionary[str, Any]],
+    window_start: float,
+    window_end: float,
+) -> Dict[str, Any]:
+    """$Compute throughput and outcome distribution from audit records."""
+    distribution: Dict[str, int] = {}
+    total_labelled = 0
+    total_latency = 0.0
+    latency_count = 0
+    for record in records:
+        outcome = record.get("outcome")
+        if outcome is None:
+            continue
+        outcome_key = str(outcome).lower()
+        distribution[outcome_key] = distribution.get(outcome_key, 0) + 1
+        total_labelled += 1
+        latency = record.get("latency_ms")
+        if latency is Not None:
+            try:
+                total_latency += float(latency)
+                latency_count += 1
+            except (TypeError, ValueError):
+                pass
+
+    duration_seconds = max(window_end - window_start, 0.0)
+    duration_hours = duration_seconds / 3600.0
+    claims_per_hour = (
+        round(total_labelled / duration_hours, 4) if duration_hours > 0 else 0.0
+    )
+    average_latency_ms = (
+        round(total_latency / latency_count, 2) if latency_count > 0 else None
+    )
+
+    return {
+        "window": {
+            "start": window_start,
+            "end": window_end,
+            "duration_seconds": duration_seconds,
+        },
+        "total_claims": total_labelled,
+        "claims_per_hour": claims_per_hour,
+        "outcome_distribution": dict(sorted(distribution.items())),
+        "average_time_to_decision_ms": average_latency_ms,
+    }
+
+
+@_router.get(
+    "/ai/decision-audit/throughput",
+    response_model=ResultEnvelope[Dict[str, Any]],
+)
+async def get_throughput_aggregate(
+    http_request: Request,
+    created_after: Optional[float] = Query(
+        None,
+        description="Window start as a Unix timestamp. Defaults to one hour ago.",
+    ),
+    created_before: Optional[float] = Query(
+        None,
+        description="Window end as a Unix timestamp. Defaults to now.",
+    ),
+    decision_type: Optional[str] = Query(
+        None,
+        description="Optional decision type filter, e.g. humanitarian_verification.",
+    ),
+    refresh: bool = Query(
+        False,
+        description="Bypass the cache and recompute the aggregate.",
+    ),
+) -> ResultEnvelope[Dict[str, Any]]:
+    """Return throughput and outcome aggregates for a time window.
+
+    The response is shaped for direct dashboard consumption: claims per
+    hour, the pass/review/reject distribution, and the average time to
+    decision. Results are cached per window for a short TTL so repeated
+    dashboard polls do not rescan the audit store. Pass `refresh=true` to
+    force a recompute.
+    """
+    now = time.time()
+    window_end = created_before if created_before is not None else now
+    window_start = created_after if created_after is not None else window_end - 3600.0
+    if window_start > window_end:
+        raise HTTPException(
+            status_code=400,
+            detail="created_after must be <= created_before",
+        )
+
+    cache_key = (window_start, window_end, decision_type)
+    if not refresh:
+        cached = _THROUGHPUT_CACHE.get(cache_key)
+        if cached is not None:
+            return ResultEnvelope[Dict[str, Any]](
+                result=cached,
+                confidence=None,
+                reasons=None,
+                anchor_metadata=None,
+                trace_id=getattr(http_request.state, "correlation_id", "") or None,
+            )
+
+    store = _resolve_store(http_request)
+    records = store.query(
+        trace_id=None,
+        claim_id=None,
+        campaign_ref=None,
+        decision_type=decision_type,
+        created_after=window_start,
+        created_before=window_end,
+        offset=0,
+        limit=None,
+    )
+    record_dicts = [r.to_dict() for r in records]
+    aggregate = _compute_throughput(record_dicts, window_start, window_end)
+    aggregate["cached"] = False
+    aggregate["computed_at"] = now
+    _THROUGHPUT_CACHE.set(cache_key, aggregate)
+
+    return ResultEnvelope[Dict[str, Any]](
+        result=aggregate,
+        confidence=None,
+        reasons=None,
+        anchor_metadata=None,
+        trace_id=getattr(http_request.state, "correlation_id", "") or None,
+    )
+
+
+@_router.get(
     "/ai/decision-audit",
     response_model=None,
 )
@@ -200,7 +319,7 @@ async def query_decision_audit(
     ),
     decision_type: Optional[str] = Query(
         None,
-        description="Filter by decision type, e.g. humanitarian_verification "
+        description="Filter by decision type, e.g. humanitarian_verification"
         "or fraud_detection.",
     ),
     created_after: Optional[float] = Query(
@@ -221,17 +340,17 @@ async def query_decision_audit(
         ge=0,
         description="Number of matching records to skip (pagination for export).",
     ),
-    limit: int = Query(100, ge=1, le=_MAX_EXPORT_LIMIT),
+    limit: int = Query(100, ge=1, le=MAX_EXPORT_LIMIT),
 ):
     """Return or export decision audit records matching the supplied filters.
 
-    At least one of ``trace_id``, ``claim_id``, or ``campaign_ref`` is
+    At least one of `trace_id`, `claim_id`, or `campaign_ref` is
     required. Supplying several narrows the result (logical AND). Records
     come back newest first.
 
-    Set ``format=csv`` or ``format=ndjson`` for a streamed downloadable export
+    Set `format=csv` or `format=ndjson` for a streamed downloadable export
     that uses the same filters and redaction as the JSON query. Paginate large
-    exports with ``offset`` and ``limit`` (export limit cap is higher than the
+    exports with `offset` and `limit` (export limit cap is higher than the
     JSON query cap).
     """
     _require_query_identifier(trace_id, claim_id, campaign_ref)
@@ -245,10 +364,10 @@ async def query_decision_audit(
 
     # JSON responses keep the tighter cap so a broad query cannot dump the
     # whole retention window into one envelope.
-    if export_format == "json" and limit > _MAX_LIMIT:
+    if export_format == "json" and limit > MAX_LIMIT:
         raise HTTPException(
             status_code=400,
-            detail=f"limit must be <= {_MAX_LIMIT} for JSON responses",
+            detail=f"limit must be <= {MAX_LIMIT} for JSON responses",
         )
 
     store = _resolve_store(http_request)
@@ -263,7 +382,7 @@ async def query_decision_audit(
         limit=limit,
     )
 
-    if export_format in _EXPORT_FORMATS:
+    if export_format in EXPORT_FORMATS:
         # Stream so large exports are not loaded fully into a response buffer.
         filename = f"decision-audit.{export_format}"
         if export_format == "ndjson":
@@ -293,63 +412,6 @@ async def query_decision_audit(
 
 
 @router.get(
-    "/ai/decision-audit/throughput",
-    response_model=ResultEnvelope[Dict[str, Any]],
-)
-async def get_decision_audit_throughput(
-    http_request: Request,
-    window_seconds: float = Query(
-        _DEFAULT_THROUGHPUT_WINDOW,
-        gt=0,
-        le=_MAX_THROUGHPUT_WINDOW,
-        description="Lookback window in seconds (bounded to avoid full-history scans).",
-    ),
-    decision_type: Optional[str] = Query(
-        None,
-        description="Optional decision type filter, e.g. humanitarian_verification.",
-    ),
-) -> ResultEnvelope[Dict[str, Any]]:
-    """Return throughput and outcome-distribution aggregates for a time window.
-
-    Summarises claims processed per hour, the pass/review/reject distribution,
-    and the average time-to-decision so a dashboard can render directly without
-    aggregating raw audit records. Results are cached briefly per window so
-    repeated dashboard polls do not rescan the audit store.
-    """
-    window_end = time.time()
-    window_start = window_end - window_seconds
-
-    cache = _throughput_cache(http_request)
-    cache_key = (round(window_start, 3), round(window_end, 3))
-    cached = cache.get(cache_key)
-    if cached is not None and (time.time() - cached[0]) < _THROUGHPUT_CACHE_TTL:
-        aggregate = cached[1]
-    else:
-        store = _resolve_store(http_request)
-        records = store.query(
-            decision_type=decision_type,
-            created_after=window_start,
-            created_before=window_end,
-            offset=0,
-            limit=_MAX_EXPORT_LIMIT,
-        )
-        aggregate = _compute_throughput(records, window_start, window_end)
-        # Drop stale entries so the cache stays bounded.
-        now = time.time()
-        for key in [k for k, v in cache.items() if (now - v[0]) >= _THROUGHPUT_CACHE_TTL]:
-            cache.pop(key, None)
-        cache[cache_key] = (now, aggregate)
-
-    return ResultEnvelope[Dict[str, Any]](
-        result=aggregate,
-        confidence=None,
-        reasons=None,
-        anchor_metadata=None,
-        trace_id=getattr(http_request.state, "correlation_id", "") or None,
-    )
-
-
-@router.get(
     "/ai/decision-audit/{record_id}",
     response_model=ResultEnvelope[Dict[str, Any]],
 )
@@ -357,7 +419,7 @@ async def get_decision_audit_record(
     http_request: Request,
     record_id: str,
 ) -> ResultEnvelope[Dict[str, Any]]:
-    """Return a single decision audit record by its ``record_id``."""
+    """Return a single decision audit record by its `record_id`."""
     store = _resolve_store(http_request)
     record = store.get(record_id)
     if record is None:
