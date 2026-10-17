@@ -20,6 +20,7 @@ from api.v1 import (
     dead_letter,
     redaction_preview,
     decision_audit,
+    throughput,
 )
 
 v1_router = APIRouter(prefix="/v1")
@@ -35,3 +36,4 @@ v1_router.include_router(uploads.router)
 v1_router.include_router(dead_letter.router)
 v1_router.include_router(redaction_preview.router)
 v1_router.include_router(decision_audit.router)
+v1_router.include_router(throughput.router)

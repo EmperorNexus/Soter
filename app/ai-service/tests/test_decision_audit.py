@@ -8,6 +8,8 @@ One test class per acceptance criterion:
 * sensitive fields are redacted per ``logging_redaction.py`` before persistence
 * records survive process restart
 * retention is configurable
+* export mode streams CSV/NDJSON with the same filters and redaction (#1206)
+* a dashboard-friendly aggregate endpoint summarizes throughput (#1210)
 """
 
 from __future__ import annotations
@@ -48,6 +50,7 @@ def client(store):
         app.state.decision_audit_store = store
         yield test_client
     app.state.decision_audit_store = previous
+
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +266,92 @@ class TestQueryability:
 
 
 # ---------------------------------------------------------------------------
+# Issue #1206: export mode on the query endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestDecisionAuditExport:
+    def _seed(self, store):
+        early = store.record(
+            "humanitarian_verification",
+            "eligible",
+            claim_id="export-claim",
+            campaign_ref="export-campaign",
+            inputs={"aid_claim": "Reach me at export.worker@example.com"},
+        )
+        time.sleep(0.01)
+        late = store.record(
+            "fraud_detection",
+            "flagged",
+            claim_id="export-claim-2",
+            campaign_ref="export-campaign",
+            reasons=["ok"],
+        )
+        return early, late
+
+    def test_ndjson_export_streams_redacted_rows(self, client, store):
+        self._seed(store)
+        response = client.get(
+            "/v1/ai/decision-audit?campaign_ref=export-campaign&format=ndjson"
+        )
+        assert response.status_code == 200, response.text
+        assert "application/x-ndjson" in response.headers["content-type"]
+        assert "attachment" in response.headers.get("content-disposition", "")
+        lines = [ln for ln in response.text.strip().splitlines() if ln]
+        assert len(lines) == 2
+        rows = [json.loads(ln) for ln in lines]
+        assert all(r["campaign_ref"] == "export-campaign" for r in rows)
+        # Sensitive fields already redacted at write time remain redacted.
+        blob = response.text
+        assert "export.worker@example.com" not in blob
+        assert "[REDACTED]" in blob
+
+    def test_csv_export_has_header_and_rows(self, client, store):
+        self._seed(store)
+        response = client.get(
+            "/v1/ai/decision-audit?campaign_ref=export-campaign&format=csv"
+        )
+        assert response.status_code == 200, response.text
+        assert "text/csv" in response.headers["content-type"]
+        lines = response.text.strip().splitlines()
+        assert lines[0].startswith("record_id,")
+        assert len(lines) == 3  # header + 2 rows
+
+    def test_export_respects_date_range_and_pagination(self, client, store):
+        early, late = self._seed(store)
+        mid = (early.created_at + late.created_at) / 2.0
+        only_late = client.get(
+            f"/v1/ai/decision-audit?campaign_ref=export-campaign"
+            f"&format=ndjson&created_after={mid}"
+        )
+        assert only_late.status_code == 200
+        rows = [json.loads(ln) for ln in only_late.text.strip().splitlines() if ln]
+        assert len(rows) == 1
+        assert rows[0]["record_id"] == late.record_id
+
+        page = client.get(
+            "/v1/ai/decision-audit?campaign_ref=export-campaign&format=ndjson&limit=1&offset=1"
+        )
+        assert page.status_code == 200
+        page_rows = [json.loads(ln) for ln in page.text.strip().splitlines() if ln]
+        assert len(page_rows) == 1
+        assert page_rows[0]["record_id"] == early.record_id
+
+    def test_export_requires_identifier_like_json_query(self, client):
+        response = client.get("/v1/ai/decision-audit?format=csv")
+        assert response.status_code == 400
+
+    def test_json_query_still_works_with_date_filters(self, client, store):
+        early, late = self._seed(store)
+        mid = (early.created_at + late.created_at) / 2.0
+        response = client.get(
+            f"/v1/ai/decision-audit?campaign_ref=export-campaign&created_after={mid}"
+        )
+        assert response.status_code == 200
+        assert len(response.json()["result"]) == 1
+
+
+# ---------------------------------------------------------------------------
 # AC3: redaction before persistence
 # ---------------------------------------------------------------------------
 
@@ -450,3 +539,84 @@ class TestRetention:
         with pytest.raises(Exception) as excinfo:
             settings.validate_configuration()
         assert "DECISION_AUDIT_RETENTION_DAYS" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# Issue #1210: dashboard-friendly throughput aggregate endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestThroughputAggregate:
+    def _seed(self, store):
+        now = time.time()
+        outcomes = [
+            ("humanitarian_verification", "eligible", now - 300),
+            ("humanitarian_verification", "eligible", now - 200),
+            ("humanitarian_verification", "ineligible", now - 100),
+            ("fraud_detection", "flagged", now - 400),
+            ("fraud_detection", "cleared", now - 50),
+        ]
+        for decision_type, outcome, created_at in outcomes:
+            record = store.record(
+                decision_type,
+                outcome,
+                claim_id=f"claim-{outcome}-{int(created_at)}",
+                campaign_ref="campaign-throughput",
+            )
+            record.created_at = created_at
+
+    def test_empty_window_returns_zeroed_aggregates(self, client):
+        response = client.get(
+            "/v1/ai/decision-audit/throughput?window_seconds=3600"
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["total"] == 0
+        assert body["claims_per_hour"] == 0.0
+        assert body["outcomes"] == {}
+        assert body["average_time_to_decision_seconds"] is None
+
+    def test_window_with_mixed_outcomes(self, client, store):
+        self._seed(store)
+        response = client.get(
+            "/v1/ai/decision-audit/throughput?window_seconds=3600"
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["total"] == 5
+        assert body["outcomes"]["eligible"] == 2
+        assert body["outcomes"]["ineligible"] == 1
+        assert body["outcomes"]["flagged"] == 1
+        assert body["outcomes"]["cleared"] == 1
+        assert body["claims_per_hour"] == pytest.approx(5.0, rel=1e-6)
+        assert body["average_time_to_decision_seconds"] is not None
+
+    def test_window_excludes_older_records(self, client, store):
+        self._seed(store)
+        response = client.get(
+            "/v1/ai/decision-audit/throughput?window_seconds=150"
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["total"] == 3
+        assert body["outcomes"]["eligible"] == 1
+        assert body["outcomes"]["ineligible"] == 1
+        assert body["outcomes"]["cleared"] == 1
+
+    def test_response_is_cached_between_calls(self, client, store):
+        self._seed(store)
+        first = client.get(
+            "/v1/ai/decision-audit/throughput?window_seconds=3600"
+        )
+        assert first.status_code == 200, first.text
+        second = client.get(
+            "/v1/ai/decision-audit/throughput?window_seconds=3600"
+        )
+        assert second.status_code == 200, second.text
+        assert first.json() == second.json()
+
+    def test_window_seconds_is_bounded(self, client):
+        response = client.get(
+            "/v1/ai/decision-audit/throughput?window_seconds=999999999"
+        )
+        assert response.status_code == 400

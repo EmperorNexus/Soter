@@ -49,12 +49,14 @@ from threading import Lock
 from typing import Any, Dict, Iterable, List, Optional, Set
 
 from logging_redaction import redact
+from redaction_ruleset import REDACTION_RULESET_VERSION
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "AUDIT_RECORD_SCHEMA_VERSION",
     "DecisionAuditRecord",
+    "DecisionAuditThroughput",
     "DecisionAuditStore",
     "build_store_from_settings",
     "get_store",
@@ -68,6 +70,11 @@ AUDIT_RECORD_SCHEMA_VERSION = "1"
 #: Number of appends between opportunistic retention sweeps. Pruning rewrites
 #: the whole log, so it must not run on every single write.
 _PRUNE_EVERY_N_WRITES = 100
+
+#: Default window (seconds) for throughput aggregates when the caller does not
+#: specify one. One hour matches the "claims processed per hour" dashboard
+#: cadence and keeps the scan bounded.
+_DEFAULT_THROUGHPUT_WINDOW_SECONDS = 3600.0
 
 _SECONDS_PER_DAY = 86400.0
 
@@ -116,6 +123,9 @@ class DecisionAuditRecord:
     inputs: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
     schema_version: str = AUDIT_RECORD_SCHEMA_VERSION
+    #: Redaction rule-set version that redacted this record (issue #1428).
+    #: ``None`` only for records persisted before versioning existed.
+    redaction_ruleset_version: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -142,12 +152,60 @@ class DecisionAuditRecord:
         }
         redacted = _redact_value(data)
         redacted.update(preserved)
+        # Stamp the rule set that did this redaction, so the version always
+        # reflects the rules in force when the record was persisted.
+        redacted["redaction_ruleset_version"] = REDACTION_RULESET_VERSION
         return DecisionAuditRecord(**redacted)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "DecisionAuditRecord":
         known = set(cls.__dataclass_fields__)  # type: ignore[attr-defined]
         return cls(**{k: v for k, v in data.items() if k in known})
+
+
+@dataclass
+class DecisionAuditThroughput:
+    """Aggregate throughput/outcome summary over a bounded time window.
+
+    Shaped for direct dashboard consumption: counts, a per-hour rate, the
+    pass/review/reject distribution, and the average time-to-decision. Built
+    from the in-memory index rather than re-scanning the durable log on every
+    call, so repeated dashboard polls stay cheap.
+    """
+
+    window_start: float
+    window_end: float
+    window_seconds: float
+    total: int
+    per_hour: float
+    outcomes: Dict[str, int]
+    outcome_distribution: Dict[str, float]
+    average_time_to_decision_seconds: Optional[float]
+    decision_types: Dict[str, int]
+    generated_at: float = field(default_factory=time.time)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+#: Outcomes that count as a "pass" for the distribution summary.
+_PASS_OUTCOMES = frozenset({"pass", "passed", "approve", "approved", "accept"})
+#: Outcomes that count as a "review" (needs human follow-up).
+_REVIEW_OUTCOMES = frozenset({"review", "needs_review", "escalate", "escalated"})
+#: Outcomes that count as a "reject".
+_REJECT_OUTCOMES = frozenset({"reject", "rejected", "deny", "denied", "fail", "failed"})
+
+
+def _outcome_bucket(outcome: str) -> str:
+    """Map a free-form outcome string onto pass/review/reject/other."""
+    normalised = (outcome or "").strip().lower()
+    if normalised in _PASS_OUTCOMES:
+        return "pass"
+    if normalised in _REVIEW_OUTCOMES:
+        return "review"
+    if normalised in _REJECT_OUTCOMES:
+        return "reject"
+    return "other"
 
 
 class DecisionAuditStore:
@@ -381,12 +439,18 @@ class DecisionAuditStore:
         claim_id: Optional[str] = None,
         campaign_ref: Optional[str] = None,
         decision_type: Optional[str] = None,
+        created_after: Optional[float] = None,
+        created_before: Optional[float] = None,
+        offset: int = 0,
         limit: int = 100,
     ) -> List[DecisionAuditRecord]:
         """Return matching records, newest first.
 
         Supplying several identifiers intersects them (logical AND), so an
         operator can narrow to "this claim, on this campaign" precisely.
+        Optional ``created_after`` / ``created_before`` bound the result to a
+        date range (Unix timestamps). ``offset`` skips leading matches for
+        paginated exports (issue #1206).
         """
         with self._lock:
             candidate_ids: Optional[Set[str]] = None
@@ -410,10 +474,82 @@ class DecisionAuditStore:
             if decision_type:
                 matches = [r for r in matches if r.decision_type == decision_type]
 
+            if created_after is not None:
+                matches = [r for r in matches if r.created_at >= created_after]
+            if created_before is not None:
+                matches = [r for r in matches if r.created_at <= created_before]
+
             matches.sort(key=lambda r: r.created_at, reverse=True)
+            if offset and offset > 0:
+                matches = matches[offset:]
             if limit and limit > 0:
                 matches = matches[:limit]
             return matches
+
+    def throughput(
+        self,
+        *,
+        window_seconds: float = _DEFAULT_THROUGHPUT_WINDOW_SECONDS,
+        decision_type: Optional[str] = None,
+        now: Optional[float] = None,
+    ) -> DecisionAuditThroughput:
+        """Aggregate throughput and outcome distribution over a time window.
+
+        Scans only the in-memory index (bounded by the retention policy, not
+        the full on-disk history) so a dashboard can poll this cheaply. The
+        window is ``[now - window_seconds, now]``; ``decision_type`` narrows
+        the aggregate to one class of decision when supplied.
+        """
+        end = time.time() if now is None else now
+        span = max(float(window_seconds), 0.0)
+        start = end - span
+
+        with self._lock:
+            matches = [
+                r
+                for r in self._records
+                if start <= r.created_at <= end
+                and (decision_type is None or r.decision_type == decision_type)
+            ]
+
+        total = len(matches)
+        outcomes: Dict[str, int] = {}
+        decision_types: Dict[str, int] = {}
+        buckets = {"pass": 0, "review": 0, "reject": 0, "other": 0}
+        durations: List[float] = []
+
+        for record in matches:
+            outcomes[record.outcome] = outcomes.get(record.outcome, 0) + 1
+            decision_types[record.decision_type] = (
+                decision_types.get(record.decision_type, 0) + 1
+            )
+            buckets[_outcome_bucket(record.outcome)] += 1
+            decided_at = record.metadata.get("decided_at")
+            if isinstance(decided_at, (int, float)):
+                delta = record.created_at - float(decided_at)
+                if delta >= 0:
+                    durations.append(delta)
+
+        distribution: Dict[str, float] = {}
+        if total:
+            for bucket, count in buckets.items():
+                distribution[bucket] = count / total
+
+        hours = span / 3600.0 if span > 0 else 0.0
+        per_hour = (total / hours) if hours > 0 else 0.0
+        average_ttd = (sum(durations) / len(durations)) if durations else None
+
+        return DecisionAuditThroughput(
+            window_start=start,
+            window_end=end,
+            window_seconds=span,
+            total=total,
+            per_hour=per_hour,
+            outcomes=outcomes,
+            outcome_distribution=distribution,
+            average_time_to_decision_seconds=average_ttd,
+            decision_types=decision_types,
+        )
 
     def __len__(self) -> int:
         with self._lock:
