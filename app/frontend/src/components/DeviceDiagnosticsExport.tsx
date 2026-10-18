@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useState, useEffect } from 'react';
 import {
   generateDeviceDiagnostics,
   SupportDiagnosticsBundle,
@@ -13,12 +13,9 @@ export function DeviceDiagnosticsExport() {
   const [showJsonPreview, setShowJsonPreview] = useState<boolean>(false);
   const [downloadSuccess, setDownloadSuccess] = useState<boolean>(false);
 
-  useEffect(() => {
-    fetchDiagnostics();
-  }, []);
-
-  const fetchDiagnostics = async () => {
-    setLoading(true);
+  // No synchronous setState here so the mount effect does not cascade renders;
+  // `loading` starts as true and the refresh button flips it explicitly.
+  const fetchDiagnostics = useCallback(async () => {
     try {
       const data = await generateDeviceDiagnostics();
       setDiagnostics(data);
@@ -27,7 +24,21 @@ export function DeviceDiagnosticsExport() {
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
+
+  const refreshDiagnostics = useCallback(() => {
+    setLoading(true);
+    void fetchDiagnostics();
+  }, [fetchDiagnostics]);
+
+  useEffect(() => {
+    // Canonical data-fetching effect shape (react.dev): an effect-local async
+    // function fires the initial load; no setState runs synchronously on mount.
+    async function startFetching() {
+      await fetchDiagnostics();
+    }
+    void startFetching();
+  }, [fetchDiagnostics]);
 
   const handleCopy = async () => {
     if (!diagnostics) return;
@@ -87,7 +98,7 @@ export function DeviceDiagnosticsExport() {
         </div>
 
         <button
-          onClick={fetchDiagnostics}
+          onClick={refreshDiagnostics}
           disabled={loading}
           className="self-start text-xs font-medium text-blue-600 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300"
         >
@@ -159,6 +170,25 @@ export function DeviceDiagnosticsExport() {
               </p>
               <p className="mt-0.5 text-xs text-slate-500">
                 Mock Mode: {diagnostics.clientState.mockMode ? 'Enabled' : 'Disabled'}
+              </p>
+            </div>
+
+            <div className="rounded-xl border border-slate-200 bg-slate-50/50 p-4 dark:border-slate-800 dark:bg-slate-800/40">
+              <span className="text-xs font-medium uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                Battery &amp; Sync
+              </span>
+              <p className="mt-1 text-base font-semibold text-slate-900 dark:text-slate-100">
+                {diagnostics.battery.available
+                  ? `${diagnostics.battery.levelPercent}%${diagnostics.battery.charging ? ' (charging)' : ''}`
+                  : 'Unavailable'}
+              </p>
+              <p className="mt-0.5 text-xs text-slate-500">
+                Threshold {diagnostics.battery.batteryThresholdPercent}% ·{' '}
+                {diagnostics.battery.available
+                  ? diagnostics.battery.syncDeferredForBattery
+                    ? 'Sync deferred (battery)'
+                    : 'Sync active'
+                  : 'Sync state unknown'}
               </p>
             </div>
 

@@ -118,9 +118,35 @@
     "taskCache": "Cache de tâches",
     "cacheTotal": "Total",
     "clearSyncedCache": "Effacer le cache synchronisé",
+    "exportLocalData": "Exporter le résumé des données locales",
+    "exportLocalDataHint": "Partage les décomptes des aides, tâches et diagnostics récents en cache",
+    "exportFailedTitle": "Impossible d'exporter les données",
+    "exportFailedMessage": "Le résumé des données locales n'a pas pu être préparé ou partagé. Veuillez réessayer.",
+    "clearAllLocalData": "Effacer toutes les données locales",
+    "clearAllLocalDataHint": "Supprime définitivement les données en cache et les tâches en attente après confirmation",
+    "clearLocalDataConfirmTitle": "Effacer toutes les données locales ?",
+    "clearLocalDataConfirmBase": "Cette action supprime définitivement les aides et détails en cache, les tâches, les diagnostics de santé, les préférences de l'application et les sessions de portefeuille/authentification de cet appareil.",
+    "queuedItemsWillBeRemoved": "Les {count} éléments de synchronisation en attente seront supprimés.",
+    "unsyncedQueueWillBeLost": "{count} élément(s) en attente non synchronisé(s) seront perdus et ne seront pas envoyés.",
+    "noUnsyncedQueue": "Aucun élément non synchronisé n'est en attente d'envoi.",
+    "cannotUndo": "Cette action est irréversible.",
+    "queueCheckFailedTitle": "Impossible de vérifier la file hors ligne",
+    "queueCheckFailedMessage": "Les tâches en attente n'ont pas pu être vérifiées ; les données locales n'ont donc pas été effacées. Veuillez réessayer.",
+    "localDataClearedTitle": "Données locales effacées",
+    "localDataClearedMessage": "Toutes les données locales de l'application ont été supprimées.",
+    "clearLocalDataFailedTitle": "Impossible d'effacer les données locales",
+    "clearLocalDataFailedMessage": "Certaines données locales n'ont pas pu être effacées. Veuillez réessayer depuis les paramètres.",
     "yourPublicKey": "Votre clé publique",
     "stellarLabFaucet": "Airdrop de Stellar Lab",
-    "friendbotApi": "API Friendbot"
+    "friendbotApi": "API Friendbot",
+    "syncFrequency": "Fréquence de synchronisation",
+    "syncFrequencyHint": "Choisissez la fréquence de synchronisation en arrière-plan",
+    "syncFrequencyAggressive": "Fréquente",
+    "syncFrequencyNormal": "Normale",
+    "syncFrequencyConservative": "Conservatrice",
+    "syncFrequencyAggressiveHint": "Synchronise toutes les 5 minutes",
+    "syncFrequencyNormalHint": "Synchronise toutes les 15 minutes (par défaut)",
+    "syncFrequencyConservativeHint": "Synchronise toutes les 60 minutes"
   },
   "tasks": {
     "title": "Tâches",
@@ -200,7 +226,14 @@
     "step1": "Étape 1 : Choisir une photo",
     "step2": "Étape 2 : Aperçu",
     "chooseAgain": "Choisir à nouveau",
-    "step3": "Étape 3 : Téléverser"
+    "step3": "Étape 3 : Téléverser",
+    "storageLowTitle": "Stockage faible",
+    "storageLowBody": "Il ne reste qu'environ {free} de stockage libre après prise en compte des envois en attente. La capture de la preuve peut échouer en cours de route et la photo pourrait être perdue.",
+    "storageCriticalTitle": "Stockage presque plein",
+    "storageCriticalBody": "Il ne reste que {free} de stockage libre. Libérez de l'espace avant de capturer la preuve.",
+    "storageBannerBody": "Stockage libre : environ {free} (dont {pending} retenus par les envois en attente). La capture peut échouer si l'espace vient à manquer.",
+    "storageBannerA11y": "Avertissement de stockage : l'espace libre est faible, la capture de preuve peut échouer",
+    "storageContinue": "Continuer quand même"
   },
   "errors": {
     "networkError": "Erreur réseau. Vérifiez votre connexion.",
@@ -298,6 +331,10 @@
     "networkStatus": "État du réseau :",
     "networkType": "Type de réseau :",
     "internetReachable": "Internet accessible :",
+    "batteryLevel": "Niveau de batterie :",
+    "batteryCharging": "Batterie en charge :",
+    "batteryThreshold": "Seuil de batterie :",
+    "syncDeferredBattery": "Synchronisation différée (batterie) :",
     "environment": "Environnement : "
   },
   "camera": {
@@ -318,5 +355,15 @@
     "reasonManual": "Activé manuellement",
     "subtitle": "L'actualisation, les médias et la synchronisation en arrière-plan sont réduits.",
     "accessible": "Le mode économiseur est actif. {reason}. L'actualisation, les médias et la synchronisation en arrière-plan sont réduits."
+  },
+  "networkGuard": {
+    "mainnetTitle": "⚠️ Mainnet Détecté",
+    "networkIssueTitle": "⚠️ Problème de Réseau",
+    "reconnectWallet": "Reconnecter le Portefeuille",
+    "reconnectWalletHint": "Déconnecte la session en cours et ouvre WalletConnect pour se reconnecter sur le bon réseau",
+    "switchNetwork": "Changer de Réseau",
+    "switchNetworkHint": "Ouvre votre portefeuille pour modifier le paramètre de réseau",
+    "dismiss": "Ignorer",
+    "dismissHint": "Ignorer cette alerte réseau"
   }
 }

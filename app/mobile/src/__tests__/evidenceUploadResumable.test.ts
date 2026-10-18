@@ -1,5 +1,9 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { base64ToUint8Array, sha256Hex } from '../services/syncQueue';
+import {
+  base64ToUint8Array,
+  sha256Hex,
+  uint8ArrayToBase64,
+} from '../services/syncQueue';
 
 const mockFetch = jest.fn();
 global.fetch = mockFetch as typeof fetch;
@@ -46,6 +50,59 @@ describe('Resumable Evidence Upload Chunks', () => {
       const hash = await sha256Hex(data);
       // SHA-256 for "Hello World"
       expect(hash).toBe('a591a6d40bf420404a011733cfb7b190d62c65bf0bcda32b57b277d9ad9f146e');
+    });
+
+    it('still digests when the platform has no crypto.subtle', async () => {
+      // A React Native release bundle has no `crypto.subtle`, which is what
+      // made every chunk upload fail on device with "WebCrypto subtle is not
+      // available". Removing it must not change the digest.
+      const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'crypto');
+      Object.defineProperty(globalThis, 'crypto', {
+        value: undefined,
+        configurable: true,
+      });
+
+      try {
+        const hash = await sha256Hex(new TextEncoder().encode('Hello World'));
+        expect(hash).toBe(
+          'a591a6d40bf420404a011733cfb7b190d62c65bf0bcda32b57b277d9ad9f146e',
+        );
+      } finally {
+        if (descriptor) {
+          Object.defineProperty(globalThis, 'crypto', descriptor);
+        } else {
+          delete (globalThis as { crypto?: unknown }).crypto;
+        }
+      }
+    });
+  });
+
+  describe('uint8ArrayToBase64', () => {
+    it('produces standard padded base64 for every remainder length', () => {
+      expect(uint8ArrayToBase64(new Uint8Array([]))).toBe('');
+      expect(uint8ArrayToBase64(new TextEncoder().encode('Hello World'))).toBe(
+        'SGVsbG8gV29ybGQ=',
+      );
+      expect(uint8ArrayToBase64(new Uint8Array([0]))).toBe('AA==');
+      expect(uint8ArrayToBase64(new Uint8Array([0, 0]))).toBe('AAA=');
+      expect(uint8ArrayToBase64(new Uint8Array([0, 0, 0]))).toBe('AAAA');
+      expect(uint8ArrayToBase64(new Uint8Array([251, 255, 190, 1]))).toBe(
+        '+/++AQ==',
+      );
+    });
+
+    it('round-trips arbitrary bytes (the chunk upload path)', () => {
+      const bytes = new Uint8Array(1021);
+      for (let i = 0; i < bytes.length; i += 1) {
+        bytes[i] = (i * 31 + 7) % 256;
+      }
+
+      expect(uint8ArrayToBase64(bytes)).toBe(
+        Buffer.from(bytes).toString('base64'),
+      );
+      expect(Array.from(base64ToUint8Array(uint8ArrayToBase64(bytes)))).toEqual(
+        Array.from(bytes),
+      );
     });
   });
 

@@ -8,6 +8,7 @@ import {
   getAidDetailsCacheTimestamp,
 } from '../services/aidCache';
 import { ThemeProvider } from '../theme/ThemeContext';
+import { LanguageProvider } from '../contexts/LanguageContext';
 import { NavigationContainer } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 
@@ -70,15 +71,17 @@ const Stack = createNativeStackNavigator();
 const renderScreen = (aidId = 'aid-101') => {
   return render(
     <ThemeProvider>
-      <NavigationContainer>
-        <Stack.Navigator>
-          <Stack.Screen
-            name="AidDetails"
-            component={AidDetailsScreen}
-            initialParams={{ aidId }}
-          />
-        </Stack.Navigator>
-      </NavigationContainer>
+      <LanguageProvider>
+        <NavigationContainer>
+          <Stack.Navigator>
+            <Stack.Screen
+              name="AidDetails"
+              component={AidDetailsScreen}
+              initialParams={{ aidId }}
+            />
+          </Stack.Navigator>
+        </NavigationContainer>
+      </LanguageProvider>
     </ThemeProvider>,
   );
 };

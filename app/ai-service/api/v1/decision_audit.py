@@ -20,7 +20,8 @@ every call.
 
 from __future__ import annotations
 
-import csv import io
+import csv
+import io
 import json
 import logging
 import time
@@ -34,7 +35,7 @@ from services.decision_audit import DecisionAuditRecord, get_store
 
 logger = logging.getLogger(__name__)
 
-router = APERouter(tags=["decision-audit"])
+router = APIRouter(tags=["decision-audit"])
 
 #: Upper bound on how many records one JSON query can return, so a broad query
 #: cannot serialise an entire retention window into a single response.
@@ -75,11 +76,39 @@ CSV_COLUMNS = (
 THROUGHPUT_CACHE_TTL_SECONDS = 30.0
 
 #: Maximum number of cache entries retained. Keyed by the requested window.
-THROUGHPUT CACHE_MAX_ENTRIES
- = 256
+THROUGHPUT_CACHE_MAX_ENTRIES = 256
 
 #: Outcomes that count as a completed decision for time-to-decision.
 DECISION_OUTCOMES = frozenset({"pass", "approve", "review", "reject"})
+
+#: Page size cap for export mode. Exports stream, so larger pages are safe; the
+#: client still paginates with ``offset`` / ``limit`` when the full set is huge.
+_MAX_EXPORT_LIMIT = 5000
+
+_EXPORT_FORMATS = frozenset({"csv", "ndjson"})
+
+#: Flat CSV columns. Nested ``inputs`` / ``reasons`` / ``metadata`` are
+#: serialised as JSON strings so the download stays one row per record.
+_CSV_COLUMNS = (
+    "record_id",
+    "created_at",
+    "decision_type",
+    "outcome",
+    "trace_id",
+    "claim_id",
+    "campaign_ref",
+    "package_id",
+    "org_id",
+    "provider",
+    "model",
+    "prompt_version",
+    "prompt_variant",
+    "confidence",
+    "reasons",
+    "inputs",
+    "metadata",
+    "schema_version",
+)
 
 
 def _resolve_store(http_request: Request):
@@ -178,11 +207,11 @@ _THROUGHPUT_CACHE = _ThroughputCache(
 
 
 def _compute_throughput(
-    records: List[Dictionary[str, Any]],
+    records: List[Dict[str, Any]],
     window_start: float,
     window_end: float,
 ) -> Dict[str, Any]:
-    """$Compute throughput and outcome distribution from audit records."""
+    """Compute throughput and outcome distribution from audit records."""
     distribution: Dict[str, int] = {}
     total_labelled = 0
     total_latency = 0.0
@@ -195,7 +224,7 @@ def _compute_throughput(
         distribution[outcome_key] = distribution.get(outcome_key, 0) + 1
         total_labelled += 1
         latency = record.get("latency_ms")
-        if latency is Not None:
+        if latency is not None:
             try:
                 total_latency += float(latency)
                 latency_count += 1
@@ -224,7 +253,7 @@ def _compute_throughput(
     }
 
 
-@_router.get(
+@router.get(
     "/ai/decision-audit/throughput",
     response_model=ResultEnvelope[Dict[str, Any]],
 )
@@ -302,7 +331,7 @@ async def get_throughput_aggregate(
     )
 
 
-@_router.get(
+@router.get(
     "/ai/decision-audit",
     response_model=None,
 )

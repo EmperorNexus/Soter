@@ -22,6 +22,8 @@ import {
   GetAidPackageResult,
   GetAidPackageCountParams,
   GetAidPackageCountResult,
+  GetCampaignTokenTotalsParams,
+  GetCampaignTokenTotalsResult,
   GetTokenBalanceParams,
   GetTokenBalanceResult,
   ContractMetadata,
@@ -32,8 +34,32 @@ import {
   GetTransactionStatusResult,
   TxStatus,
   AidPackage,
+  ContractVersionParams,
+  MigrateContractParams,
+  MigrateContractResult,
+  AdminState,
+  AdminTransferParams,
+  AdminTransferResult,
+  TransferAdminParams,
+  PendingWithdrawal,
+  ProposeSurplusWithdrawalParams,
+  SurplusWithdrawalParams,
+  SurplusWithdrawalResult,
+  SetDelegateParams,
+  SetDelegateResult,
+  RevokeDelegateParams,
+  RevokeDelegateResult,
+  GetDelegateParams,
+  GetDelegateResult,
+  GetDelegateHistoryParams,
+  GetDelegateHistoryResult,
+  DelegateHistoryEntry,
 } from './onchain.adapter';
 import { createHash } from 'crypto';
+import {
+  SURPLUS_WITHDRAWAL_TIMELOCK_SECS,
+  SurplusWithdrawalTimelockNotElapsedError,
+} from './utils/surplus-withdrawal.errors';
 
 /**
  * Lifecycle states a mock aid package can occupy.
@@ -68,8 +94,57 @@ interface MockAidPackage {
 @Injectable()
 export class MockOnchainAdapter implements OnchainAdapter {
   private readonly mockPackages = new Map<string, MockAidPackage>();
+  private readonly mockDelegates = new Map<
+    string,
+    { address: string; expiresAt?: number }
+  >();
+  private readonly mockDelegateHistory = new Map<
+    string,
+    DelegateHistoryEntry[]
+  >();
   private readonly mockEscrowAddress =
     'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
+  private readonly mockContractVersions = new Map<string, number>();
+
+  /**
+   * Admin/pending-admin per contract, mirroring the contract's two-step
+   * transfer storage so the mock can be exercised end to end.
+   */
+  private readonly mockAdmins = new Map<string, string>();
+  private readonly mockPendingAdmins = new Map<string, string>();
+  private readonly mockContractId = 'MOCK_CONTRACT_ID';
+
+  /**
+   * Pending surplus withdrawal proposals per contract, mirroring the
+   * contract's single `KEY_PENDING_WITHDRAWAL` instance slot.
+   */
+  private readonly mockPendingWithdrawals = new Map<
+    string,
+    PendingWithdrawal
+  >();
+
+  /**
+   * Delay applied between a proposal and its execution.
+   *
+   * Defaults to the contract's real delay. Tests that need the execute leg to
+   * succeed in the same run set this to 0, which reproduces a matured timelock
+   * without waiting a day.
+   */
+  mockSurplusWithdrawalDelaySeconds = SURPLUS_WITHDRAWAL_TIMELOCK_SECS;
+
+  /**
+   * Read the mock's admin pair, seeding a default admin on first access.
+   */
+  private readMockAdminState(contractId: string): AdminState {
+    if (!this.mockAdmins.has(contractId)) {
+      this.mockAdmins.set(contractId, this.mockEscrowAddress);
+    }
+    return {
+      adminAddress: this.mockAdmins.get(contractId) as string,
+      pendingAdminAddress: this.mockPendingAdmins.get(contractId) ?? null,
+      timestamp: new Date(),
+    };
+  }
 
   /**
    * Generate a deterministic mock transaction hash from input
@@ -127,7 +202,7 @@ export class MockOnchainAdapter implements OnchainAdapter {
       expiresAt: params.expiresAt,
       claimedAmount: '0',
       remainingAmount: params.amount,
-      metadata: {},
+      metadata: params.metadata ?? {},
     };
     this.mockPackages.set(params.packageId, pkg);
 
@@ -429,6 +504,45 @@ export class MockOnchainAdapter implements OnchainAdapter {
     };
   }
 
+  /**
+   * Per-campaign, per-token totals derived from the packages this mock has
+   * created. Packages carry their `campaign_ref` in metadata, so a mock
+   * campaign created through `createAidPackage` participates in reconciliation
+   * exactly like a real one.
+   */
+  async getCampaignTokenTotals(
+    params: GetCampaignTokenTotalsParams,
+  ): Promise<GetCampaignTokenTotalsResult> {
+    await Promise.resolve();
+
+    let totalLocked = BigInt(0);
+    let totalClaimed = BigInt(0);
+
+    for (const pkg of this.mockPackages.values()) {
+      if (pkg.token !== params.tokenAddress) {
+        continue;
+      }
+      if (pkg.metadata.campaign_ref !== params.campaignRef) {
+        continue;
+      }
+
+      totalClaimed += BigInt(pkg.claimedAmount || '0');
+      if (pkg.status === 'Created') {
+        totalLocked += BigInt(pkg.remainingAmount || pkg.amount || '0');
+      }
+    }
+
+    return {
+      totals: {
+        campaignRef: params.campaignRef,
+        tokenAddress: params.tokenAddress,
+        totalLocked: totalLocked.toString(),
+        totalClaimed: totalClaimed.toString(),
+      },
+      timestamp: new Date(),
+    };
+  }
+
   async getTokenBalance(
     params: GetTokenBalanceParams,
   ): Promise<GetTokenBalanceResult> {
@@ -464,10 +578,242 @@ export class MockOnchainAdapter implements OnchainAdapter {
     };
   }
 
+  async getContractVersion(params: ContractVersionParams): Promise<number> {
+    await Promise.resolve();
+    return this.mockContractVersions.get(params.contractId) ?? 1;
+  }
+
+  async migrateContract(
+    params: MigrateContractParams,
+  ): Promise<MigrateContractResult> {
+    await Promise.resolve();
+    const previousVersion = await this.getContractVersion(params);
+    this.mockContractVersions.set(params.contractId, params.newVersion);
+    return {
+      contractId: params.contractId,
+      transactionHash: this.generateMockHash(
+        `migrate-${params.contractId}-${params.newVersion}`,
+      ),
+      previousVersion,
+      newVersion: params.newVersion,
+      timestamp: new Date(),
+    };
+  }
+
   async getPauseState(): Promise<PauseState> {
     await Promise.resolve();
     return {
       isPaused: false,
+      timestamp: new Date(),
+    };
+  }
+
+  async getAdminState(params: AdminTransferParams = {}): Promise<AdminState> {
+    await Promise.resolve();
+    return this.readMockAdminState(params.contractId ?? this.mockContractId);
+  }
+
+  async transferAdmin(
+    params: TransferAdminParams,
+  ): Promise<AdminTransferResult> {
+    await Promise.resolve();
+    const contractId = params.contractId ?? this.mockContractId;
+    const state = this.readMockAdminState(contractId);
+
+    if (!params.newAdminAddress?.trim()) {
+      throw new BadRequestException('newAdminAddress is required');
+    }
+    if (params.newAdminAddress === state.adminAddress) {
+      throw new BadRequestException(
+        'InvalidPendingAdmin: new admin must differ from the current admin',
+      );
+    }
+
+    this.mockPendingAdmins.set(contractId, params.newAdminAddress);
+
+    return {
+      contractId,
+      transactionHash: this.generateMockHash(
+        `transfer-admin-${contractId}-${params.newAdminAddress}`,
+      ),
+      adminAddress: state.adminAddress,
+      pendingAdminAddress: params.newAdminAddress,
+      timestamp: new Date(),
+    };
+  }
+
+  async acceptAdmin(
+    params: AdminTransferParams = {},
+  ): Promise<AdminTransferResult> {
+    await Promise.resolve();
+    const contractId = params.contractId ?? this.mockContractId;
+    const pendingAdmin = this.mockPendingAdmins.get(contractId);
+    if (!pendingAdmin) {
+      throw new BadRequestException('NoPendingTransfer');
+    }
+
+    this.mockAdmins.set(contractId, pendingAdmin);
+    this.mockPendingAdmins.delete(contractId);
+
+    return {
+      contractId,
+      transactionHash: this.generateMockHash(
+        `accept-admin-${contractId}-${pendingAdmin}`,
+      ),
+      adminAddress: pendingAdmin,
+      pendingAdminAddress: null,
+      timestamp: new Date(),
+    };
+  }
+
+  async cancelAdminTransfer(
+    params: AdminTransferParams = {},
+  ): Promise<AdminTransferResult> {
+    await Promise.resolve();
+    const contractId = params.contractId ?? this.mockContractId;
+    const adminAddress = this.mockAdmins.get(contractId) ?? '';
+    if (!this.mockPendingAdmins.has(contractId)) {
+      throw new BadRequestException('NoPendingTransfer');
+    }
+
+    this.mockPendingAdmins.delete(contractId);
+
+    return {
+      contractId,
+      transactionHash: this.generateMockHash(
+        `cancel-admin-transfer-${contractId}`,
+      ),
+      adminAddress,
+      pendingAdminAddress: null,
+      timestamp: new Date(),
+    };
+  }
+
+  /**
+   * Read the mock's pending surplus withdrawal for a contract, if any.
+   */
+  async getPendingWithdrawal(
+    params: SurplusWithdrawalParams = {},
+  ): Promise<PendingWithdrawal | null> {
+    await Promise.resolve();
+    return (
+      this.mockPendingWithdrawals.get(
+        params.contractId ?? this.mockContractId,
+      ) ?? null
+    );
+  }
+
+  /**
+   * Record a surplus withdrawal proposal and start the timelock. Mirrors the
+   * contract's rule that only one proposal may be pending at a time.
+   */
+  async proposeSurplusWithdrawal(
+    params: ProposeSurplusWithdrawalParams,
+  ): Promise<SurplusWithdrawalResult> {
+    await Promise.resolve();
+    const contractId = params.contractId ?? this.mockContractId;
+
+    const to = params.to?.trim();
+    const token = params.token?.trim();
+    const amount = params.amount?.trim();
+
+    if (!to) {
+      throw new BadRequestException('to is required');
+    }
+    if (!token) {
+      throw new BadRequestException('token is required');
+    }
+    if (!amount || !/^\d+$/.test(amount) || BigInt(amount) <= 0n) {
+      throw new BadRequestException(
+        'amount must be a positive integer string in the token base unit',
+      );
+    }
+    if (this.mockPendingWithdrawals.has(contractId)) {
+      throw new BadRequestException(
+        'SurplusWithdrawalPending: a withdrawal proposal is already pending',
+      );
+    }
+
+    const pending: PendingWithdrawal = {
+      to,
+      token,
+      amount,
+      executableAt:
+        Math.floor(Date.now() / 1000) + this.mockSurplusWithdrawalDelaySeconds,
+    };
+    this.mockPendingWithdrawals.set(contractId, pending);
+
+    return {
+      contractId,
+      transactionHash: this.generateMockHash(
+        `propose-surplus-withdrawal-${contractId}-${to}-${amount}`,
+      ),
+      pendingWithdrawal: { ...pending },
+      timestamp: new Date(),
+    };
+  }
+
+  /**
+   * Abandon a pending proposal. Moves no funds.
+   */
+  async cancelSurplusWithdrawal(
+    params: SurplusWithdrawalParams = {},
+  ): Promise<SurplusWithdrawalResult> {
+    await Promise.resolve();
+    const contractId = params.contractId ?? this.mockContractId;
+
+    if (!this.mockPendingWithdrawals.delete(contractId)) {
+      throw new BadRequestException(
+        'SurplusWithdrawalNotPending: no withdrawal proposal is pending',
+      );
+    }
+
+    return {
+      contractId,
+      transactionHash: this.generateMockHash(
+        `cancel-surplus-withdrawal-${contractId}`,
+      ),
+      pendingWithdrawal: null,
+      timestamp: new Date(),
+    };
+  }
+
+  /**
+   * Transfer the proposed funds, clearing the proposal. Rejects while the
+   * timelock is still active with a distinct error carrying the wait.
+   */
+  async executeSurplusWithdrawal(
+    params: SurplusWithdrawalParams = {},
+  ): Promise<SurplusWithdrawalResult> {
+    await Promise.resolve();
+    const contractId = params.contractId ?? this.mockContractId;
+    const pending = this.mockPendingWithdrawals.get(contractId);
+
+    if (!pending) {
+      throw new BadRequestException(
+        'SurplusWithdrawalNotPending: no withdrawal proposal is pending',
+      );
+    }
+
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    if (nowSeconds < pending.executableAt) {
+      const remaining = pending.executableAt - nowSeconds;
+      throw new SurplusWithdrawalTimelockNotElapsedError(
+        `SurplusWithdrawalTimelockActive: withdrawal of ${pending.amount} to ` +
+          `${pending.to} becomes executable in ${remaining}s ` +
+          `(at ledger timestamp ${pending.executableAt})`,
+        pending.executableAt,
+      );
+    }
+
+    this.mockPendingWithdrawals.delete(contractId);
+
+    return {
+      contractId,
+      transactionHash: this.generateMockHash(
+        `execute-surplus-withdrawal-${contractId}-${pending.amount}`,
+      ),
+      pendingWithdrawal: null,
       timestamp: new Date(),
     };
   }
@@ -566,6 +912,132 @@ export class MockOnchainAdapter implements OnchainAdapter {
         receiptPointer: params.receiptPointer,
         adapter: 'mock',
       },
+    };
+  }
+
+  async setDelegate(params: SetDelegateParams): Promise<SetDelegateResult> {
+    await Promise.resolve();
+    const transactionHash = this.generateMockHash(
+      `set-delegate-${params.packageId}-${params.delegateAddress}-${Date.now()}`,
+    );
+
+    // Get previous delegate for history
+    const existing = this.mockDelegates.get(params.packageId);
+    const previousDelegate = existing?.address;
+
+    // Store the delegate
+    this.mockDelegates.set(params.packageId, {
+      address: params.delegateAddress,
+      expiresAt: params.expiresAt,
+    });
+
+    // Record history
+    const historyEntry: DelegateHistoryEntry = {
+      packageId: params.packageId,
+      previousDelegate,
+      newDelegate: params.delegateAddress,
+      changedBy: params.adminAddress,
+      changedAt: Math.floor(Date.now() / 1000),
+      reason: 'delegate_set',
+    };
+    const existing_history =
+      this.mockDelegateHistory.get(params.packageId) ?? [];
+    this.mockDelegateHistory.set(params.packageId, [
+      ...existing_history,
+      historyEntry,
+    ]);
+
+    return {
+      packageId: params.packageId,
+      delegateAddress: params.delegateAddress,
+      transactionHash,
+      timestamp: new Date(),
+      status: 'success',
+      expiresAt: params.expiresAt,
+      metadata: {
+        packageId: params.packageId,
+        adminAddress: params.adminAddress,
+        delegateAddress: params.delegateAddress,
+        expiresAt: params.expiresAt,
+        adapter: 'mock',
+      },
+    };
+  }
+
+  async revokeDelegate(
+    params: RevokeDelegateParams,
+  ): Promise<RevokeDelegateResult> {
+    await Promise.resolve();
+    const transactionHash = this.generateMockHash(
+      `revoke-delegate-${params.packageId}-${Date.now()}`,
+    );
+
+    const existing = this.mockDelegates.get(params.packageId);
+    if (existing) {
+      // Record revocation in history
+      const historyEntry: DelegateHistoryEntry = {
+        packageId: params.packageId,
+        previousDelegate: existing.address,
+        newDelegate: '',
+        changedBy: params.adminAddress,
+        changedAt: Math.floor(Date.now() / 1000),
+        reason: 'delegate_revoked',
+      };
+      const existing_history =
+        this.mockDelegateHistory.get(params.packageId) ?? [];
+      this.mockDelegateHistory.set(params.packageId, [
+        ...existing_history,
+        historyEntry,
+      ]);
+      this.mockDelegates.delete(params.packageId);
+    }
+
+    return {
+      packageId: params.packageId,
+      transactionHash,
+      timestamp: new Date(),
+      status: 'success',
+      metadata: {
+        packageId: params.packageId,
+        adminAddress: params.adminAddress,
+        adapter: 'mock',
+      },
+    };
+  }
+
+  async getDelegate(params: GetDelegateParams): Promise<GetDelegateResult> {
+    await Promise.resolve();
+
+    const delegate = this.mockDelegates.get(params.packageId);
+    const nowSec = Math.floor(Date.now() / 1000);
+
+    // Check if delegate has expired
+    if (delegate && delegate.expiresAt && delegate.expiresAt <= nowSec) {
+      return {
+        packageId: params.packageId,
+        timestamp: new Date(),
+      };
+    }
+
+    return {
+      packageId: params.packageId,
+      delegateAddress: delegate?.address,
+      expiresAt: delegate?.expiresAt,
+      timestamp: new Date(),
+    };
+  }
+
+  async getDelegateHistory(
+    params: GetDelegateHistoryParams,
+  ): Promise<GetDelegateHistoryResult> {
+    await Promise.resolve();
+
+    const history = this.mockDelegateHistory.get(params.packageId) ?? [];
+
+    return {
+      packageId: params.packageId,
+      history,
+      timestamp: new Date(),
     };
   }
 }

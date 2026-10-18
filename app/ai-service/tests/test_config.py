@@ -20,6 +20,7 @@ _ISOLATED_ENV_KEYS = (
     "PROOF_OF_LIFE_CONFIDENCE_THRESHOLD",
     "PROOF_OF_LIFE_MIN_FACE_SIZE",
     "LLM_TIMEOUT_SECONDS",
+    "PROVIDER_CAPABILITY_MATRIX",
     "CACHE_TTL_TASK_STATUS",
     "ASYNC_JOB_IDLE_TIMEOUT_SECONDS",
     "PORT",
@@ -272,6 +273,61 @@ def test_empty_llm_fallback_order_rejected(monkeypatch):
         settings.validate_configuration()
 
     assert "LLM_PROVIDER_FALLBACK_ORDER" in str(excinfo.value)
+
+
+def test_invalid_provider_capability_matrix_rejected(monkeypatch):
+    _isolate_env(monkeypatch)
+    config = Settings(_env_file=None)
+    config.provider_capability_matrix = {"openai": ["streaming"]}
+
+    with pytest.raises(ConfigurationError) as excinfo:
+        config.validate_configuration()
+
+    assert "PROVIDER_CAPABILITY_MATRIX" in str(excinfo.value)
+    assert "streaming" in str(excinfo.value)
+
+
+def test_provider_cost_ceiling_configuration_validates(monkeypatch):
+    _isolate_env(monkeypatch)
+    config = Settings(_env_file=None)
+    config.llm_provider_cost_ceilings = {
+        "groq": {
+            "limit_usd": 10.0,
+            "window": "daily",
+            "fallback_provider": "openai",
+        }
+    }
+    config.validate_configuration()
+
+
+def test_more_expensive_provider_fallback_is_rejected(monkeypatch):
+    _isolate_env(monkeypatch)
+    config = Settings(_env_file=None)
+    config.llm_provider_cost_ceilings = {
+        "openai": {
+            "limit_usd": 10.0,
+            "window": "daily",
+            "fallback_provider": "groq",
+        }
+    }
+
+    with pytest.raises(ConfigurationError) as excinfo:
+        config.validate_configuration()
+
+    assert "must have lower configured token rates" in str(excinfo.value)
+
+
+def test_invalid_provider_cost_ceiling_is_rejected(monkeypatch):
+    _isolate_env(monkeypatch)
+    config = Settings(_env_file=None)
+    config.llm_provider_cost_ceilings = {
+        "openai": {"limit_usd": -1, "window": "weekly"}
+    }
+
+    with pytest.raises(ConfigurationError) as excinfo:
+        config.validate_configuration()
+
+    assert "LLM_PROVIDER_COST_CEILINGS" in str(excinfo.value)
 
 
 def test_default_llm_model_cost_rates_validate(monkeypatch):

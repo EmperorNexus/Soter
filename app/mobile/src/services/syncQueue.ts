@@ -8,6 +8,7 @@ import {
 
 import { config } from '../config';
 import { buildCorrelationHeaders, structuredLogger } from './logger';
+import { sha256, toHex } from './sha256';
 
 const API_URL = config.apiUrl;
 
@@ -54,6 +55,16 @@ export interface EvidenceUploadPayload {
   estimatedSize?: number;
 }
 
+/**
+ * The platform's WebCrypto `subtle` implementation, when one exists.
+ *
+ * React Native does not provide it: `react-native-get-random-values`
+ * polyfills `getRandomValues` only, and Metro's `crypto` shim has no
+ * `webcrypto`. Both lookups are therefore guarded, and `sha256Hex` falls
+ * back to the pure-JS digest in `./sha256` — without it, every evidence
+ * chunk upload throws `WebCrypto subtle is not available` on a real device
+ * (release build) and the sync queue can never drain.
+ */
 const getSubtleCrypto = () => {
   if (typeof crypto !== 'undefined' && crypto.subtle) {
     return crypto.subtle;
@@ -108,14 +119,39 @@ export function base64ToUint8Array(base64: string): Uint8Array {
   return bytes;
 }
 
+const BASE64_ALPHABET =
+  'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+
+/** Standard (padded) base64 encoding of a byte array. */
+export function uint8ArrayToBase64(bytes: Uint8Array): string {
+  const groups: string[] = [];
+
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i];
+    const has1 = i + 1 < bytes.length;
+    const has2 = i + 2 < bytes.length;
+    const b1 = has1 ? bytes[i + 1] : 0;
+    const b2 = has2 ? bytes[i + 2] : 0;
+
+    groups.push(
+      BASE64_ALPHABET[b0 >> 2] +
+        BASE64_ALPHABET[((b0 & 0x03) << 4) | (b1 >> 4)] +
+        (has1 ? BASE64_ALPHABET[((b1 & 0x0f) << 2) | (b2 >> 6)] : '=') +
+        (has2 ? BASE64_ALPHABET[b2 & 0x3f] : '='),
+    );
+  }
+
+  return groups.join('');
+}
+
 export async function sha256Hex(data: Uint8Array): Promise<string> {
   const subtle = getSubtleCrypto();
-  if (!subtle) {
-    throw new Error('WebCrypto subtle is not available');
+  if (subtle) {
+    const hashBuffer = await subtle.digest('SHA-256', data);
+    return toHex(new Uint8Array(hashBuffer));
   }
-  const hashBuffer = await subtle.digest('SHA-256', data);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
+  // Device fallback: no `crypto.subtle` in a React Native release bundle.
+  return toHex(sha256(data));
 }
 
 export interface ClaimSubmissionPayload {
@@ -577,10 +613,24 @@ const runAction = async (action: QueuedSyncAction) => {
         const chunkBytes = fileBytes.subarray(start, end);
 
         const checksum = await sha256Hex(chunkBytes);
-        const chunkBlob = new Blob([chunkBytes], { type: 'application/octet-stream' });
 
+        // The chunk is attached as a `data:` URI file part rather than a
+        // `Blob`. React Native's Blob cannot be built from bytes — its
+        // `createFromParts` throws "Creating blobs from 'ArrayBuffer' and
+        // 'ArrayBufferView' are not supported" — so `new Blob([chunkBytes])`
+        // fails on device (it works under Jest, where Blob is Node's, which
+        // is why the unit tests and the CI harness never disagreed until the
+        // upload ran on an emulator). A `{ uri, name, type }` part is the
+        // form React Native's networking layer expects, and both platforms
+        // read its bytes from the `data:` URI (Android:
+        // `RequestBodyUtil.getFileInputStream` base64-decodes it; iOS:
+        // `processDataForHTTPQuery` loads it through `NSURLRequest`).
         const formData = new FormData();
-        formData.append('chunk', chunkBlob, requestData.filename);
+        formData.append('chunk', {
+          uri: `data:application/octet-stream;base64,${uint8ArrayToBase64(chunkBytes)}`,
+          name: requestData.filename,
+          type: 'application/octet-stream',
+        } as unknown as Blob);
         formData.append('index', index.toString());
         formData.append('checksum', checksum);
 

@@ -9,7 +9,9 @@ import {
   Linking,
   Pressable,
   ScrollView,
+  Share,
 } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useTheme } from '../theme/ThemeContext';
 import { AppColors } from '../theme/useAppTheme';
@@ -17,6 +19,7 @@ import { useBiometric } from '../contexts/BiometricContext';
 import { useNotification } from '../contexts/NotificationContext';
 import { useSaverMode } from '../contexts/SaverModeContext';
 import { useCrashReporting } from '../contexts/CrashReportingContext';
+import { useSyncDeferral } from '../contexts/SyncDeferralContext';
 import { config } from '../config';
 import { useWallet } from '../contexts/WalletContext';
 import { getAccountExplorerUrl } from '../explorerUtils';
@@ -25,6 +28,10 @@ import { clearAidCache, getAidCacheSummary } from '../services/aidCache';
 import { clearTaskCache, getTaskCacheSummary } from '../services/taskCache';
 import { useTranslation } from '../i18n/useTranslation';
 import { useLanguage } from '../contexts/LanguageContext';
+import { clearHealthCache, loadCachedHealthStatus } from '../services/healthCache';
+import { clearSyncQueue, getSyncQueueState } from '../services/syncQueue';
+import { secureClearAll } from '../services/secureStorage';
+import { structuredLogger } from '../services/logger';
 
 const STELLAR_LAB_FAUCET_URL = 'https://lab.stellar.org/account/fund';
 const STELLAR_FRIENDBOT_URL = 'https://friendbot-testnet.stellar.org';
@@ -75,6 +82,7 @@ export const SettingsScreen: React.FC = () => {
     enabled: crashReportingEnabled,
     toggle: toggleCrashReporting,
   } = useCrashReporting();
+  const { syncFrequency, setSyncFrequency } = useSyncDeferral();
   const { publicKey, status: walletStatus } = useWallet();
   const isWalletConnected = walletStatus === 'connected';
   const [copiedKey, setCopiedKey] = useState(false);
@@ -188,6 +196,131 @@ export const SettingsScreen: React.FC = () => {
       );
     } catch {
       Alert.alert('Unable to Clear Cache', 'Please try again from Settings.');
+    }
+  };
+
+  const exportLocalData = async () => {
+    try {
+      const [aid, task, keys, queueState, healthStatus] = await Promise.all([
+        getAidCacheSummary(),
+        getTaskCacheSummary(),
+        AsyncStorage.getAllKeys(),
+        getSyncQueueState(),
+        loadCachedHealthStatus(),
+      ]);
+      const unsyncedCount = queueState.items.filter(
+        (item) => item.state !== 'submitted',
+      ).length;
+      const queueSummary = queueState.items.length
+        ? queueState.items
+            .map((item) => `- ${item.type}: ${item.state}`)
+            .join('\n')
+        : '- No queued items';
+      const aidDetailsCount = keys.filter(
+        (key) =>
+          key.startsWith('@soter/aid_details_') &&
+          !key.startsWith('@soter/aid_details_timestamp_'),
+      ).length;
+      const summary = `Soter Local Data Summary
+Generated: ${new Date().toISOString()}
+
+Cached data
+- Aid packages: ${aid.itemCount} (${formatBytes(aid.sizeBytes)})
+- Aid details: ${aidDetailsCount}
+- Tasks: ${task.itemCount} (${formatBytes(task.sizeBytes)})
+- Health diagnostics cache: ${healthStatus ? 'available' : 'none'}
+
+Sync queue
+- ${unsyncedCount} unsynced item${unsyncedCount === 1 ? '' : 's'} of ${queueState.items.length}
+${queueSummary}
+
+Recent diagnostics
+${structuredLogger.getDiagnosticsText(12)}`;
+      await Share.share({
+        title: 'Soter Local Data Summary',
+        message: summary,
+      });
+    } catch {
+      Alert.alert(
+        t('settings.exportFailedTitle'),
+        t('settings.exportFailedMessage'),
+      );
+    }
+  };
+
+  const showClearLocalDataConfirmation = async () => {
+    try {
+      const queueState = await getSyncQueueState();
+      const unsyncedCount = queueState.items.filter(
+        (item) => item.state !== 'submitted',
+      ).length;
+      Alert.alert(
+        t('settings.clearLocalDataConfirmTitle'),
+        `${t('settings.clearLocalDataConfirmBase')}\n\n${t('settings.queuedItemsWillBeRemoved', { count: queueState.items.length })}\n\n${unsyncedCount > 0 ? t('settings.unsyncedQueueWillBeLost', { count: unsyncedCount }) : t('settings.noUnsyncedQueue')}\n\n${t('settings.cannotUndo')}`,
+        [
+          { text: t('common.cancel'), style: 'cancel' },
+          {
+            text: t('settings.clearAllLocalData'),
+            style: 'destructive',
+            onPress: () =>
+              void clearAllLocalData(queueState.items.length, unsyncedCount),
+          },
+        ],
+      );
+    } catch {
+      Alert.alert(
+        t('settings.queueCheckFailedTitle'),
+        t('settings.queueCheckFailedMessage'),
+      );
+    }
+  };
+
+  const clearAllLocalData = async (
+    confirmedQueueCount: number,
+    confirmedUnsyncedCount: number,
+  ) => {
+    try {
+      const queueState = await getSyncQueueState();
+      const unsyncedCount = queueState.items.filter(
+        (item) => item.state !== 'submitted',
+      ).length;
+      if (
+        queueState.items.length !== confirmedQueueCount ||
+        unsyncedCount !== confirmedUnsyncedCount
+      ) {
+        await showClearLocalDataConfirmation();
+        return;
+      }
+
+      const legacyKeys = [
+        'biometric_lock_enabled',
+        'SOTER_PROCESSED_NOTIFICATION_IDS',
+        'SOTER_DEVICE_TOKEN_ID',
+      ];
+      const appKeys = (await AsyncStorage.getAllKeys()).filter(
+        (key) =>
+          key.startsWith('@soter/') ||
+          key.startsWith('@Soter:') ||
+          legacyKeys.includes(key),
+      );
+
+      await clearSyncQueue();
+      await AsyncStorage.multiRemove([
+        ...new Set([...appKeys, '@soter/sync-queue']),
+      ]);
+      await clearHealthCache();
+      await secureClearAll();
+      structuredLogger.clear();
+      await refreshCacheUsage();
+      Alert.alert(
+        t('settings.localDataClearedTitle'),
+        t('settings.localDataClearedMessage'),
+      );
+    } catch {
+      Alert.alert(
+        t('settings.clearLocalDataFailedTitle'),
+        t('settings.clearLocalDataFailedMessage'),
+      );
     }
   };
 
@@ -464,6 +597,64 @@ export const SettingsScreen: React.FC = () => {
           style={styles.sectionHeader}
           accessibilityRole="header"
         >
+          {t('settings.syncFrequency')}
+        </Text>
+        <Text style={styles.sectionHint}>{t('settings.syncFrequencyHint')}</Text>
+
+        <View style={styles.frequencyRow}>
+          {(['aggressive', 'normal', 'conservative'] as const).map((freq) => {
+            const isSelected = syncFrequency === freq;
+            const label =
+              freq === 'aggressive'
+                ? t('settings.syncFrequencyAggressive')
+                : freq === 'normal'
+                  ? t('settings.syncFrequencyNormal')
+                  : t('settings.syncFrequencyConservative');
+            const hint =
+              freq === 'aggressive'
+                ? t('settings.syncFrequencyAggressiveHint')
+                : freq === 'normal'
+                  ? t('settings.syncFrequencyNormalHint')
+                  : t('settings.syncFrequencyConservativeHint');
+
+            return (
+              <Pressable
+                key={freq}
+                style={[
+                  styles.frequencyChip,
+                  isSelected && styles.frequencyChipActive,
+                ]}
+                accessibilityRole="radio"
+                accessibilityState={{ selected: isSelected }}
+                accessibilityLabel={label}
+                accessibilityHint={hint}
+                onPress={() => void setSyncFrequency(freq)}
+              >
+                <Text
+                  style={[
+                    styles.frequencyChipText,
+                    isSelected && styles.frequencyChipTextActive,
+                  ]}
+                >
+                  {label}
+                </Text>
+              </Pressable>
+            );
+          })}
+        </View>
+
+        <Text style={styles.hint}>
+          {syncFrequency === 'aggressive'
+            ? t('settings.syncFrequencyAggressiveHint')
+            : syncFrequency === 'conservative'
+              ? t('settings.syncFrequencyConservativeHint')
+              : t('settings.syncFrequencyNormalHint')}
+        </Text>
+
+        <Text
+          style={styles.sectionHeader}
+          accessibilityRole="header"
+        >
           Offline Storage
         </Text>
 
@@ -513,6 +704,34 @@ export const SettingsScreen: React.FC = () => {
             onPress={() => void clearLocalCaches()}
           >
             <Text style={styles.secondaryLinkButtonText}>{t('settings.clearSyncedCache')}</Text>
+          </Pressable>
+          <Pressable
+            style={({ pressed }) => [
+              styles.secondaryLinkButton,
+              pressed && styles.linkButtonPressed,
+            ]}
+            accessibilityRole="button"
+            accessibilityLabel={t('settings.exportLocalData')}
+            accessibilityHint={t('settings.exportLocalDataHint')}
+            onPress={() => void exportLocalData()}
+          >
+            <Text style={styles.secondaryLinkButtonText}>
+              {t('settings.exportLocalData')}
+            </Text>
+          </Pressable>
+          <Pressable
+            style={({ pressed }) => [
+              styles.secondaryLinkButton,
+              pressed && styles.linkButtonPressed,
+            ]}
+            accessibilityRole="button"
+            accessibilityLabel={t('settings.clearAllLocalData')}
+            accessibilityHint={t('settings.clearAllLocalDataHint')}
+            onPress={() => void showClearLocalDataConfirmation()}
+          >
+            <Text style={[styles.secondaryLinkButtonText, { color: colors.error }]}>
+              {t('settings.clearAllLocalData')}
+            </Text>
           </Pressable>
         </View>
 
@@ -679,6 +898,32 @@ const makeStyles = (colors: AppColors) =>
       color: colors.textPrimary,
     },
     languageChipTextActive: {
+      color: '#FFFFFF',
+    },
+    frequencyRow: {
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      gap: 8,
+      marginBottom: 4,
+    },
+    frequencyChip: {
+      paddingHorizontal: 14,
+      paddingVertical: 10,
+      borderRadius: 999,
+      borderWidth: 1,
+      borderColor: colors.border,
+      backgroundColor: colors.surface,
+    },
+    frequencyChipActive: {
+      backgroundColor: colors.primary,
+      borderColor: colors.primary,
+    },
+    frequencyChipText: {
+      fontSize: 14,
+      fontWeight: '500',
+      color: colors.textPrimary,
+    },
+    frequencyChipTextActive: {
       color: '#FFFFFF',
     },
     row: {

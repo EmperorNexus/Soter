@@ -12,7 +12,7 @@ import { CameraView, BarcodeScanningResult } from 'expo-camera';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../navigation/types';
 import { useTheme } from '../theme/ThemeContext';
-import { createScanDeduper } from './scanDeduper';
+import { createScanDeduperSync } from './scanDeduper';
 import { useCameraPermission } from '../hooks/useCameraPermission';
 import { CameraPermissionDenied } from '../components/CameraPermissionDenied';
 import { useTranslation } from '../i18n/useTranslation';
@@ -23,6 +23,11 @@ import {
   recordScanReceived,
   recordScanStarted,
 } from '../services/scannerBreadcrumbs';
+import {
+  E2E_SCAN_PAYLOAD,
+  E2E_SIMULATE_SCAN_LABEL,
+  isE2ETestModeEnabled,
+} from '../e2e/testMode';
 
 type ScannerScreenNavigationProp = NativeStackNavigationProp<RootStackParamList, 'Scanner'>;
 
@@ -57,7 +62,7 @@ export const parseAidIdFromQRCode = (data: string): string | null => {
 
 export const ScannerScreen: React.FC<Props> = ({ navigation }) => {
   const [scanned, setScanned] = useState(false);
-  const [isDuplicateScan] = useState(() => createScanDeduper());
+  const [isDuplicateScan] = useState(() => createScanDeduperSync());
   const { colors } = useTheme();
   const { t } = useTranslation();
 
@@ -193,6 +198,35 @@ export const ScannerScreen: React.FC<Props> = ({ navigation }) => {
             </Text>
           </TouchableOpacity>
         </View>
+
+        {/*
+          E2E-only control (issue #932).
+
+          Anchored to the top of the overlay rather than appended to the bottom
+          control column. That column (instruction + Cancel + Switch to Bulk
+          Mode) already fills the space the edge-to-edge layout leaves above
+          the system navigation bar, so a control appended to it is centred
+          past the bar: it renders, but underneath the navigation bar, which is
+          both invisible to the user and absent from the accessibility tree
+          Maestro reads. From the top it is always on screen, and this block is
+          dead code in production because `isE2ETestModeEnabled()` is false
+          there.
+        */}
+        {isE2ETestModeEnabled() ? (
+          <View style={styles.e2eControl} pointerEvents="box-none">
+            <TouchableOpacity
+              style={styles.e2eButton}
+              accessibilityRole="button"
+              accessibilityLabel="E2E simulate a successful QR scan"
+              testID="e2e-simulate-scan"
+              onPress={() =>
+                handleBarCodeScanned({ data: E2E_SCAN_PAYLOAD } as BarcodeScanningResult)
+              }
+            >
+              <Text style={styles.e2eButtonText}>{E2E_SIMULATE_SCAN_LABEL}</Text>
+            </TouchableOpacity>
+          </View>
+        ) : null}
       </View>
 
       {/* Scan-again button — shown after a failed scan */}
@@ -308,6 +342,27 @@ const styles = StyleSheet.create({
   },
   bulkModeText: {
     fontSize: 14,
+    fontWeight: '600',
+  },
+  e2eControl: {
+    position: 'absolute',
+    top: 16,
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+  },
+  e2eButton: {
+    marginTop: 12,
+    borderWidth: 1,
+    borderColor: '#FDE68A',
+    borderRadius: 8,
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    backgroundColor: 'rgba(253,230,138,0.15)',
+  },
+  e2eButtonText: {
+    color: '#FDE68A',
+    fontSize: 13,
     fontWeight: '600',
   },
 });

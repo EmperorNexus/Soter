@@ -100,19 +100,34 @@
               }
             ]
           },
+          "fields": {
+            "anyOf": [
+              {
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Structured OCR fields to preview or redact by field type.",
+            "title": "Fields"
+          },
           "text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "description": "Input text to anonymize before LLM processing",
             "examples": [
               "John Doe from New York on 2024-01-01 requested aid"
             ],
-            "minLength": 1,
-            "title": "Text",
-            "type": "string"
+            "title": "Text"
           }
         },
-        "required": [
-          "text"
-        ],
         "title": "AnonymizeRequest",
         "type": "object"
       },
@@ -161,6 +176,15 @@
             ],
             "title": "Pii Summary",
             "type": "object"
+          },
+          "ruleset_version": {
+            "default": "1.0.0",
+            "description": "Version of the redaction rule set that produced this output",
+            "examples": [
+              "1.0.0"
+            ],
+            "title": "Ruleset Version",
+            "type": "string"
           },
           "token_counts": {
             "additionalProperties": {
@@ -1403,6 +1427,21 @@
             "default": "inference",
             "title": "Type",
             "type": "string"
+          },
+          "webhook_url": {
+            "anyOf": [
+              {
+                "format": "uri",
+                "maxLength": 2083,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional URL to receive signed task lifecycle callbacks, including processing and terminal status events.",
+            "title": "Webhook Url"
           }
         },
         "title": "InferenceRequest",
@@ -1894,6 +1933,15 @@
             "title": "Pii Summary",
             "type": "object"
           },
+          "ruleset_version": {
+            "default": "1.0.0",
+            "description": "Version of the redaction rule set that produced this output",
+            "examples": [
+              "1.0.0"
+            ],
+            "title": "Ruleset Version",
+            "type": "string"
+          },
           "segments": {
             "items": {
               "$ref": "#/components/schemas/RedactionSegment"
@@ -2235,99 +2283,6 @@
           "result"
         ],
         "title": "ResultEnvelope[List[ClaimFraudResult]]",
-        "type": "object"
-      },
-      "ResultEnvelope_List_Dict_str__Any___": {
-        "properties": {
-          "anchor_metadata": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/AnchorMetadata"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "confidence": {
-            "anyOf": [
-              {
-                "maximum": 1.0,
-                "minimum": 0.0,
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Aggregate confidence score in [0, 1].",
-            "examples": [
-              0.92
-            ],
-            "title": "Confidence"
-          },
-          "prompt_version": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Version of the prompt template used for verification.",
-            "examples": [
-              "v1"
-            ],
-            "title": "Prompt Version"
-          },
-          "reasons": {
-            "anyOf": [
-              {
-                "items": {
-                  "type": "string"
-                },
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Human-readable explanations or reasons for the result.",
-            "examples": [
-              [
-                "Liveness verification passed"
-              ]
-            ],
-            "title": "Reasons"
-          },
-          "result": {
-            "items": {
-              "type": "object"
-            },
-            "title": "Result",
-            "type": "array"
-          },
-          "trace_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Request-scoped correlation ID for distributed tracing.",
-            "examples": [
-              "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
-            ],
-            "title": "Trace Id"
-          }
-        },
-        "required": [
-          "result"
-        ],
-        "title": "ResultEnvelope[List[Dict[str, Any]]]",
         "type": "object"
       },
       "ResultEnvelope_OCRData_": {
@@ -3161,7 +3116,7 @@
     },
     "/v1/ai/decision-audit": {
       "get": {
-        "description": "Return decision audit records matching the supplied identifiers.\n\nAt least one of ``trace_id``, ``claim_id``, or ``campaign_ref`` is\nrequired: an unfiltered dump of every decision is neither a useful\ninvestigation tool nor a safe default. Supplying several narrows the\nresult (logical AND). Records come back newest first.",
+        "description": "Return or export decision audit records matching the supplied filters.\n\nAt least one of ``trace_id``, ``claim_id``, or ``campaign_ref`` is\nrequired. Supplying several narrows the result (logical AND). Records\ncome back newest first.\n\nSet ``format=csv`` or ``format=ndjson`` for a streamed downloadable export\nthat uses the same filters and redaction as the JSON query. Paginate large\nexports with ``offset`` and ``limit`` (export limit cap is higher than the\nJSON query cap).",
         "operationId": "query_decision_audit_v1_ai_decision_audit_get",
         "parameters": [
           {
@@ -3237,12 +3192,79 @@
             }
           },
           {
+            "description": "Include only records with created_at >= this Unix timestamp.",
+            "in": "query",
+            "name": "created_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Include only records with created_at >= this Unix timestamp.",
+              "title": "Created After"
+            }
+          },
+          {
+            "description": "Include only records with created_at <= this Unix timestamp.",
+            "in": "query",
+            "name": "created_before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Include only records with created_at <= this Unix timestamp.",
+              "title": "Created Before"
+            }
+          },
+          {
+            "description": "Response format: omit/json for ResultEnvelope JSON; csv or ndjson for a downloadable streamed export (issue #1206).",
+            "in": "query",
+            "name": "format",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Response format: omit/json for ResultEnvelope JSON; csv or ndjson for a downloadable streamed export (issue #1206).",
+              "title": "Format"
+            }
+          },
+          {
+            "description": "Number of matching records to skip (pagination for export).",
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "description": "Number of matching records to skip (pagination for export).",
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
             "in": "query",
             "name": "limit",
             "required": false,
             "schema": {
               "default": 100,
-              "maximum": 500,
+              "maximum": 5000,
               "minimum": 1,
               "title": "Limit",
               "type": "integer"
@@ -3253,9 +3275,7 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ResultEnvelope_List_Dict_str__Any___"
-                }
+                "schema": {}
               }
             },
             "description": "Successful Response"
@@ -3558,9 +3578,19 @@
     },
     "/v1/ai/humanitarian/verify": {
       "post": {
-        "description": "Verify an aid claim against standardised humanitarian criteria.\n\nValidates that all referenced evidence artifacts belong to the requesting\norganization before processing.  Maintains audit logs for access attempts.\n\n``artifact_access_control`` and ``humanitarian_verification_service`` are\nresolved from ``request.app.state``.  Production wires them up in the\nlifespan of ``main.app``; tests inject lightweight Mocks via the same\nstate so we never have to monkeypatch ``main`` module globals.",
+        "description": "Verify an aid claim against standardised humanitarian criteria.\n\nValidates that all referenced evidence artifacts belong to the requesting\norganization before processing.  Maintains audit logs for access attempts.\nSet ``stream=true`` to receive provider token events followed by the usual\nresult envelope; streaming bypasses response caching to return live output.\n\n``artifact_access_control`` and ``humanitarian_verification_service`` are\nresolved from ``request.app.state``.  Production wires them up in the\nlifespan of ``main.app``; tests inject lightweight Mocks via the same\nstate so we never have to monkeypatch ``main`` module globals.",
         "operationId": "verify_humanitarian_claim_v1_ai_humanitarian_verify_post",
         "parameters": [
+          {
+            "in": "query",
+            "name": "stream",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Stream",
+              "type": "boolean"
+            }
+          },
           {
             "in": "header",
             "name": "X-Org-Id",
@@ -3632,7 +3662,7 @@
     },
     "/v1/ai/inference": {
       "post": {
-        "description": "Create a background task for heavy AI inference.\n\nOffloads time-consuming AI tasks to background workers. Use the\nreturned ``task_id`` to poll for results via ``GET /ai/status/{task_id}``.\n\nContract-aware metadata fields are used to anchor verification results\nto on-chain events during Testnet demos.",
+        "description": "Create a background task for heavy AI inference.\n\nOffloads time-consuming AI tasks to background workers. Use the\nreturned ``task_id`` to poll for results via ``GET /ai/status/{task_id}``.\nOptionally provide ``webhook_url`` to receive signed callbacks when\nprocessing begins and when the task completes or fails.\n\nContract-aware metadata fields are used to anchor verification results\nto on-chain events during Testnet demos.",
         "operationId": "create_inference_task_v1_ai_inference_post",
         "requestBody": {
           "content": {

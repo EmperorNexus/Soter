@@ -1,5 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { MockOnchainAdapter } from './onchain.adapter.mock';
+import { SurplusWithdrawalTimelockNotElapsedError } from './utils/surplus-withdrawal.errors';
 
 describe('MockOnchainAdapter', () => {
   let adapter: MockOnchainAdapter;
@@ -404,6 +405,319 @@ describe('MockOnchainAdapter', () => {
           operatorAddress: 'admin',
         }),
       ).rejects.toThrow('Aid package has expired');
+    });
+  });
+
+  describe('timelocked surplus withdrawal', () => {
+    const CONTRACT = 'C_TIMELOCK_TEST';
+    const TO = 'GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
+    const TOKEN =
+      'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC';
+    const proposal = {
+      contractId: CONTRACT,
+      to: TO,
+      token: TOKEN,
+      amount: '1000',
+    };
+
+    beforeEach(() => {
+      // Reproduce a matured timelock without waiting out the contract's
+      // one-day delay, so the execute leg is reachable in a unit test.
+      adapter.mockSurplusWithdrawalDelaySeconds = 0;
+    });
+
+    it("defaults the delay to the contract's one-day timelock", () => {
+      const fresh = new MockOnchainAdapter();
+      expect(fresh.mockSurplusWithdrawalDelaySeconds).toBe(86_400);
+    });
+
+    it('reports no pending withdrawal initially', async () => {
+      await expect(
+        adapter.getPendingWithdrawal({ contractId: CONTRACT }),
+      ).resolves.toBeNull();
+    });
+
+    it('records the proposal and its executable timestamp', async () => {
+      const before = Math.floor(Date.now() / 1000);
+      adapter.mockSurplusWithdrawalDelaySeconds = 3600;
+
+      const result = await adapter.proposeSurplusWithdrawal(proposal);
+
+      expect(result.pendingWithdrawal).toMatchObject({
+        to: TO,
+        token: TOKEN,
+        amount: '1000',
+      });
+      expect(result.pendingWithdrawal!.executableAt).toBeGreaterThanOrEqual(
+        before + 3600,
+      );
+      await expect(
+        adapter.getPendingWithdrawal({ contractId: CONTRACT }),
+      ).resolves.toEqual(result.pendingWithdrawal);
+    });
+
+    it('moves no funds at the propose leg', async () => {
+      const result = await adapter.proposeSurplusWithdrawal(proposal);
+      expect(result.pendingWithdrawal).not.toBeNull();
+    });
+
+    it('refuses a second proposal while one is pending', async () => {
+      await adapter.proposeSurplusWithdrawal(proposal);
+
+      await expect(
+        adapter.proposeSurplusWithdrawal({ ...proposal, amount: '2000' }),
+      ).rejects.toThrow('SurplusWithdrawalPending');
+    });
+
+    it('rejects an execute before the timelock has elapsed', async () => {
+      adapter.mockSurplusWithdrawalDelaySeconds = 3600;
+      await adapter.proposeSurplusWithdrawal(proposal);
+
+      const error = await adapter
+        .executeSurplusWithdrawal({ contractId: CONTRACT })
+        .catch(e => e);
+
+      expect(error).toBeInstanceOf(SurplusWithdrawalTimelockNotElapsedError);
+      expect(error.executableAt).toBeGreaterThan(0);
+      // The proposal survives a premature attempt.
+      await expect(
+        adapter.getPendingWithdrawal({ contractId: CONTRACT }),
+      ).resolves.not.toBeNull();
+    });
+
+    it('executes once the timelock has elapsed and clears the proposal', async () => {
+      await adapter.proposeSurplusWithdrawal(proposal);
+
+      const result = await adapter.executeSurplusWithdrawal({
+        contractId: CONTRACT,
+      });
+
+      expect(result.pendingWithdrawal).toBeNull();
+      expect(result.transactionHash).toBeTruthy();
+      await expect(
+        adapter.getPendingWithdrawal({ contractId: CONTRACT }),
+      ).resolves.toBeNull();
+    });
+
+    it('cancels without moving funds and leaves nothing pending', async () => {
+      await adapter.proposeSurplusWithdrawal(proposal);
+
+      const result = await adapter.cancelSurplusWithdrawal({
+        contractId: CONTRACT,
+      });
+
+      expect(result.pendingWithdrawal).toBeNull();
+      await expect(
+        adapter.getPendingWithdrawal({ contractId: CONTRACT }),
+      ).resolves.toBeNull();
+    });
+
+    it('allows a new proposal after a cancellation', async () => {
+      await adapter.proposeSurplusWithdrawal(proposal);
+      await adapter.cancelSurplusWithdrawal({ contractId: CONTRACT });
+
+      await expect(
+        adapter.proposeSurplusWithdrawal(proposal),
+      ).resolves.toMatchObject({ pendingWithdrawal: expect.any(Object) });
+    });
+
+    it('rejects cancelling when nothing is pending', async () => {
+      await expect(
+        adapter.cancelSurplusWithdrawal({ contractId: CONTRACT }),
+      ).rejects.toThrow('SurplusWithdrawalNotPending');
+    });
+
+    it('rejects executing when nothing is pending', async () => {
+      await expect(
+        adapter.executeSurplusWithdrawal({ contractId: CONTRACT }),
+      ).rejects.toThrow('SurplusWithdrawalNotPending');
+    });
+
+    it('keeps proposals isolated per contract', async () => {
+      await adapter.proposeSurplusWithdrawal(proposal);
+
+      await expect(
+        adapter.getPendingWithdrawal({ contractId: 'C_OTHER' }),
+      ).resolves.toBeNull();
+      // Cancelling the other contract must not touch this one's proposal.
+      await expect(
+        adapter.cancelSurplusWithdrawal({ contractId: 'C_OTHER' }),
+      ).rejects.toThrow('SurplusWithdrawalNotPending');
+      await expect(
+        adapter.getPendingWithdrawal({ contractId: CONTRACT }),
+      ).resolves.not.toBeNull();
+    });
+
+    it.each([
+      ['a zero amount', { amount: '0' }],
+      ['a non-numeric amount', { amount: 'abc' }],
+      ['a missing destination', { to: '' }],
+      ['a missing token', { token: '' }],
+    ])('rejects %s', async (_label, override) => {
+      await expect(
+        adapter.proposeSurplusWithdrawal({ ...proposal, ...override }),
+      ).rejects.toThrow();
+    });
+  });
+
+  describe('delegate lifecycle', () => {
+    const ADMIN_ADDRESS =
+      'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
+    const DELEGATE_ADDRESS =
+      'GBUQWP3BOUZX34ULNQG23RQ6F4BFXWBTRSE53XSTE23JMCVOCJGXVSVZ';
+    const PKG_ID = 'pkg-delegate-001';
+
+    it('setDelegate should store the delegate and return success', async () => {
+      const result = await adapter.setDelegate({
+        adminAddress: ADMIN_ADDRESS,
+        packageId: PKG_ID,
+        delegateAddress: DELEGATE_ADDRESS,
+      });
+
+      expect(result.status).toBe('success');
+      expect(result.packageId).toBe(PKG_ID);
+      expect(result.delegateAddress).toBe(DELEGATE_ADDRESS);
+      expect(result.transactionHash).toHaveLength(64);
+      expect(result.timestamp).toBeInstanceOf(Date);
+      expect(result.expiresAt).toBeUndefined();
+      expect(result.metadata?.adapter).toBe('mock');
+    });
+
+    it('setDelegate with expiresAt stores expiry in result', async () => {
+      const expiresAt = Math.floor(Date.now() / 1000) + 3600;
+      const result = await adapter.setDelegate({
+        adminAddress: ADMIN_ADDRESS,
+        packageId: PKG_ID,
+        delegateAddress: DELEGATE_ADDRESS,
+        expiresAt,
+      });
+
+      expect(result.status).toBe('success');
+      expect(result.expiresAt).toBe(expiresAt);
+    });
+
+    it('getDelegate returns delegate after setDelegate', async () => {
+      await adapter.setDelegate({
+        adminAddress: ADMIN_ADDRESS,
+        packageId: PKG_ID,
+        delegateAddress: DELEGATE_ADDRESS,
+      });
+
+      const result = await adapter.getDelegate({ packageId: PKG_ID });
+
+      expect(result.packageId).toBe(PKG_ID);
+      expect(result.delegateAddress).toBe(DELEGATE_ADDRESS);
+      expect(result.timestamp).toBeInstanceOf(Date);
+    });
+
+    it('getDelegate returns undefined delegateAddress when none set', async () => {
+      const result = await adapter.getDelegate({
+        packageId: 'no-delegate-pkg',
+      });
+      expect(result.delegateAddress).toBeUndefined();
+    });
+
+    it('getDelegate returns no address when delegate is expired', async () => {
+      const pastExpiry = Math.floor(Date.now() / 1000) - 60;
+      await adapter.setDelegate({
+        adminAddress: ADMIN_ADDRESS,
+        packageId: 'pkg-expired-delegate',
+        delegateAddress: DELEGATE_ADDRESS,
+        expiresAt: pastExpiry,
+      });
+
+      const result = await adapter.getDelegate({
+        packageId: 'pkg-expired-delegate',
+      });
+      expect(result.delegateAddress).toBeUndefined();
+    });
+
+    it('revokeDelegate removes delegate and returns success', async () => {
+      await adapter.setDelegate({
+        adminAddress: ADMIN_ADDRESS,
+        packageId: PKG_ID,
+        delegateAddress: DELEGATE_ADDRESS,
+      });
+
+      const revokeResult = await adapter.revokeDelegate({
+        adminAddress: ADMIN_ADDRESS,
+        packageId: PKG_ID,
+      });
+
+      expect(revokeResult.status).toBe('success');
+      expect(revokeResult.packageId).toBe(PKG_ID);
+      expect(revokeResult.transactionHash).toHaveLength(64);
+
+      const delegateResult = await adapter.getDelegate({ packageId: PKG_ID });
+      expect(delegateResult.delegateAddress).toBeUndefined();
+    });
+
+    it('revokeDelegate on package with no delegate still returns success', async () => {
+      const result = await adapter.revokeDelegate({
+        adminAddress: ADMIN_ADDRESS,
+        packageId: 'no-delegate-to-revoke',
+      });
+      expect(result.status).toBe('success');
+    });
+
+    it('getDelegateHistory is empty for a fresh package', async () => {
+      const result = await adapter.getDelegateHistory({
+        packageId: 'fresh-pkg',
+      });
+      expect(result.history).toHaveLength(0);
+      expect(result.timestamp).toBeInstanceOf(Date);
+    });
+
+    it('getDelegateHistory records set and revoke operations', async () => {
+      const historyPkg = 'pkg-history-test';
+
+      await adapter.setDelegate({
+        adminAddress: ADMIN_ADDRESS,
+        packageId: historyPkg,
+        delegateAddress: DELEGATE_ADDRESS,
+      });
+
+      await adapter.revokeDelegate({
+        adminAddress: ADMIN_ADDRESS,
+        packageId: historyPkg,
+      });
+
+      const result = await adapter.getDelegateHistory({
+        packageId: historyPkg,
+      });
+
+      expect(result.history).toHaveLength(2);
+      expect(result.history[0].reason).toBe('delegate_set');
+      expect(result.history[0].newDelegate).toBe(DELEGATE_ADDRESS);
+      expect(result.history[0].previousDelegate).toBeUndefined();
+      expect(result.history[1].reason).toBe('delegate_revoked');
+      expect(result.history[1].previousDelegate).toBe(DELEGATE_ADDRESS);
+    });
+
+    it('getDelegateHistory tracks multiple delegate changes', async () => {
+      const multiPkg = 'pkg-multi-delegate';
+      const DELEGATE2 =
+        'GA5ZSEJYB37JRC5AVCIA5MOP4GZ5DA47EL5QRUVLYEK2OOABEXVR5CV7';
+
+      await adapter.setDelegate({
+        adminAddress: ADMIN_ADDRESS,
+        packageId: multiPkg,
+        delegateAddress: DELEGATE_ADDRESS,
+      });
+
+      await adapter.setDelegate({
+        adminAddress: ADMIN_ADDRESS,
+        packageId: multiPkg,
+        delegateAddress: DELEGATE2,
+      });
+
+      const result = await adapter.getDelegateHistory({ packageId: multiPkg });
+
+      expect(result.history).toHaveLength(2);
+      expect(result.history[0].newDelegate).toBe(DELEGATE_ADDRESS);
+      expect(result.history[0].previousDelegate).toBeUndefined();
+      expect(result.history[1].newDelegate).toBe(DELEGATE2);
+      expect(result.history[1].previousDelegate).toBe(DELEGATE_ADDRESS);
     });
   });
 });

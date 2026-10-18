@@ -529,6 +529,7 @@ export const AidDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
       <TouchableOpacity
         accessibilityRole="button"
         style={[styles.button, { backgroundColor: colors.success }]}
+        testID="aid-details-upload-evidence"
         onPress={() => navigation.navigate('EvidenceUpload', { aidId })}
         activeOpacity={0.8}
       >
@@ -630,6 +631,13 @@ const TimelineMilestoneRow = ({
   styles: ReturnType<typeof makeStyles>;
   isLast: boolean;
 }) => {
+  // `t` was referenced below without a translator in scope, so any milestone
+  // that carried a transaction hash threw `ReferenceError: Property 't'
+  // doesn't exist` while rendering the copy-hash button. The error boundary
+  // then blanked the whole screen (the Mobile E2E scan flow caught it, since
+  // the aid-details fixture includes an approval transaction hash).
+  const { t } = useTranslation();
+
   const dateLabel = milestone.timestamp
     ? formatDateTime(milestone.timestamp)
     : milestone.completed

@@ -84,6 +84,14 @@ Response body:
 ### Humanitarian Verification
 - **POST** `/ai/humanitarian/verify` - Standardized humanitarian claim verification (Sphere criteria + context factors + provider fallback)
 
+The versioned endpoint also supports optional server-sent events for token-capable
+LLM providers: send the same request to
+`/v1/ai/humanitarian/verify?stream=true`. The stream emits `token` events as
+provider output arrives, followed by a `result` event containing the usual
+result envelope. Requests without `stream=true` continue to return the normal
+single JSON envelope and use the existing response cache. Token events contain
+partial provider text; the final result event is authoritative.
+
 Request body:
 
 ```json
@@ -133,6 +141,29 @@ default (`MAX_REQUEST_TIMEOUT_SECONDS=60`). A larger timeout is reduced to the
 server ceiling and counted with the `timeout_clamped` reason label. Both values
 are configurable through environment variables.
 
+### LLM Provider Cost Ceilings
+
+`LLM_PROVIDER_COST_CEILINGS` optionally configures a USD spend ceiling for
+each provider. Set it to a JSON object keyed by provider name. Each entry
+requires `limit_usd` and a `window` of `hourly` or `daily`, and may specify a
+`fallback_provider`. Spend is estimated from the configured per-model token
+rates and shared across workers through Redis. A breached provider is skipped
+for its configured fallback; without an available fallback the verification
+is marked for manual review. Configuring ceilings requires Redis.
+
+```json
+{
+  "groq": {
+    "limit_usd": 25.0,
+    "window": "daily",
+    "fallback_provider": "openai"
+  }
+}
+```
+
+The `/ai/metrics` endpoint exposes `llm_provider_cost_ceiling_usd` and
+`llm_provider_current_spend_usd` by provider and window.
+
 **Response:**
 
 ```json
@@ -148,6 +179,20 @@ are configurable through environment variables.
     "processing_time_ms": 950
   }
 }
+```
+
+### Provider Capabilities
+
+Provider eligibility is declared centrally by `PROVIDER_CAPABILITY_MATRIX`, a
+JSON object keyed by provider name. The supported capability identifiers are
+`llm` and `ocr`; a provider is considered for a request only if its matrix
+entry includes that request's capability and it is otherwise available
+(credentials or local runtime). Existing fallback-order settings still control
+the order among eligible providers. Removing a capability from an entry
+prevents that provider from being selected for the corresponding request type.
+
+```dotenv
+PROVIDER_CAPABILITY_MATRIX={"openai":["llm"],"groq":["llm"],"test":["llm","ocr"],"tesseract":["ocr"]}
 ```
 
 ### PII Anonymization
@@ -182,6 +227,28 @@ Response body:
 }
 ```
 
+### Asynchronous Inference Webhooks
+
+`POST /v1/ai/inference` accepts an optional `webhook_url`. When supplied, the
+service POSTs signed lifecycle callbacks using the canonical AI callback
+contract: a `processing` event when a worker starts the task, followed by a
+`completed` or `failed` event. The `status` field identifies each event, and
+`taskId` and `taskType` identify the task. Webhook URLs must use HTTP or HTTPS.
+
+```json
+{
+"type": "inference",
+"data": { "document_url": "https://example.com/document.pdf" },
+"webhook_url": "https://client.example.com/task-events"
+}
+```
+
+The response still includes `task_id` and `status_url`; the existing
+`/v1/ai/status/{task_id}` and `/v1/ai/jobs/{task_id}` polling endpoints remain
+available. If `webhook_url` is omitted, the configured backend callback
+behavior is unchanged. Failed callback deliveries, including progress events,
+are recorded in the dead-letter queue and can be replayed.
+
 ### Dead-Letter Replay
 
 Failed callback deliveries (webhook POSTs to the backend that keep 4xx/5xx-ing)
@@ -208,6 +275,10 @@ Every replay attempt - success or failure - is appended to the item's
 curl -X POST "http://localhost:8000/v1/ai/dead-letter/callback:task-123/replay" \
   -H "X-User-Role: operator" -H "X-User-Id: alice"
 ```
+
+## Operations and Resilience
+
+For in-depth operational runbooks, provider failover mechanics, per-organization rate limit tiers, cost ceilings, circuit breaker alerting, and combined incident troubleshooting, see the [AI Service Operations Playbook](AI_SERVICE_OPERATIONS.md).
 
 ## Project Structure
 

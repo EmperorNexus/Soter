@@ -1,16 +1,31 @@
 from typing import Any, Dict, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+from redaction_ruleset import REDACTION_RULESET_VERSION
 from schemas.common import AnchorMetadata
 
 
 class AnonymizeRequest(BaseModel):
-    text: str = Field(
-        min_length=1,
+    text: Optional[str] = Field(
+        None,
         description="Input text to anonymize before LLM processing",
         examples=["John Doe from New York on 2024-01-01 requested aid"],
     )
+    fields: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Structured OCR fields to preview or redact by field type.",
+    )
     anchor_metadata: Optional[AnchorMetadata] = None
+
+    @model_validator(mode="after")
+    def validate_text_or_fields(self):
+        if self.text is None and self.fields is None:
+            raise ValueError("Either 'text' or 'fields' must be provided.")
+        if self.text is not None and not self.text.strip() and self.fields is None:
+            raise ValueError("'text' must not be empty when provided without fields.")
+        if self.fields is not None and not self.fields:
+            raise ValueError("'fields' must not be empty when provided.")
+        return self
 
     model_config = {
         "json_schema_extra": {
@@ -53,6 +68,11 @@ class AnonymizeResult(BaseModel):
     )
     token_counts: Dict[str, int] = Field(
         default_factory=dict, examples=[{"original": 10, "anonymized": 10}]
+    )
+    ruleset_version: str = Field(
+        default=REDACTION_RULESET_VERSION,
+        description="Version of the redaction rule set that produced this output",
+        examples=["1.0.0"],
     )
 
     model_config = {
@@ -139,6 +159,11 @@ class RedactionPreviewResult(BaseModel):
     pii_summary: Dict[str, Any] = Field(
         default_factory=dict,
         examples=[{"names": 1, "locations": 1, "dates": 1, "total": 3}],
+    )
+    ruleset_version: str = Field(
+        default=REDACTION_RULESET_VERSION,
+        description="Version of the redaction rule set that produced this output",
+        examples=["1.0.0"],
     )
 
     model_config = {

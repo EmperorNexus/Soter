@@ -38,6 +38,8 @@ export interface AppConfig {
   taskCacheMaxBytes: number;
   /** Ratio of cache usage at which the app warns operators */
   localCacheWarningRatio: number;
+  /** Retention window in milliseconds for cross-session scan deduplication */
+  crossSessionDedupeWindowMs: number;
   /** Base64-encoded SHA-256 SPKI pins for the API host (primary + backups) used for certificate pinning */
   certPinHashes: string[];
   /** Whether to pin all subdomains of the API host, not just the exact hostname */
@@ -46,6 +48,19 @@ export interface AppConfig {
   logLevel: LogLevel;
   /** API key for backend authentication */
   apiKey?: string;
+  /**
+   * Whether the build is a dedicated end-to-end test build (issue #932).
+   *
+   * When true, screens render a small set of deterministic "simulate"
+   * controls (scan result, evidence capture) that the Maestro E2E flows
+   * drive, because a headless emulator cannot produce a real QR code or
+   * camera frame. This is the environment-variable half of
+   * `isE2ETestModeEnabled()` (see `src/e2e/testMode.ts`); the primary switch
+   * is the build-time literal in `src/e2e/e2eBuildFlag.ts`, because a
+   * Gradle-built release APK cannot be relied on to inline `process.env`
+   * reads. Production builds leave both `false` and render nothing extra.
+   */
+  e2eEnabled: boolean;
 }
 
 /**
@@ -116,10 +131,14 @@ const buildConfig = (): AppConfig => {
     localCacheWarningRatio: process.env.EXPO_PUBLIC_LOCAL_CACHE_WARNING_RATIO
       ? parseFloat(process.env.EXPO_PUBLIC_LOCAL_CACHE_WARNING_RATIO)
       : 0.8,
+    crossSessionDedupeWindowMs: process.env.EXPO_PUBLIC_CROSS_SESSION_DEDUPE_WINDOW_MS
+      ? parseInt(process.env.EXPO_PUBLIC_CROSS_SESSION_DEDUPE_WINDOW_MS, 10)
+      : 24 * 60 * 60 * 1000, // Default: 24 hours
     certPinHashes,
     certPinIncludeSubdomains: process.env.EXPO_PUBLIC_CERT_PIN_INCLUDE_SUBDOMAINS === 'true',
     logLevel: (process.env.EXPO_PUBLIC_LOG_LEVEL as LogLevel) || 'warn',
     apiKey: process.env.EXPO_PUBLIC_API_KEY,
+    e2eEnabled: process.env.EXPO_PUBLIC_E2E === '1',
     isValid: errors.length === 0,
     errors,
   };
